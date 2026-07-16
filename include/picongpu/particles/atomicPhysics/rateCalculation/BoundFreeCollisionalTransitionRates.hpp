@@ -24,12 +24,14 @@
 #include "picongpu/particles/atomicPhysics/DeltaEnergyTransition.hpp"
 #include "picongpu/particles/atomicPhysics/debug/param.hpp"
 #include "picongpu/particles/atomicPhysics/rateCalculation/CollisionalRate.hpp"
+#include "picongpu/particles/atomicPhysics/rateCalculation/ThresholdClip.hpp"
 #include "picongpu/particles/atomicPhysics/rateCalculation/Multiplicities.hpp"
 #include "picongpu/particles/atomicPhysics/stateRepresentation/ConfigNumber.hpp"
 
 #include <pmacc/algorithms/math.hpp>
 
 #include <cstdint>
+#include <limits>
 
 /** @file implements calculation of rates for bound-free collisional atomic physics transitions
  *
@@ -205,7 +207,10 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
 
         /** rate for collisional bound-free (ionization) transition of ion with free electron bin
          *
-         * uses second order integration(bin middle)
+         * uses second order integration(bin middle); with useThresholdClippedBinIntegration
+         * the bin straddling the (IPD-shifted) ionization threshold is clipped to its
+         * above-threshold sub-interval, see ThresholdClip.hpp. The 3BR detailed-balance
+         * rate inherits the clip through its per-bin EII sum.
          *
          * @todo implement higher order integrations, Brian Marre, 2023
          *
@@ -216,6 +221,7 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
          * @param energyElectron kinetic energy of interacting electron(/electron bin), [eV]
          * @param energyElectronBinWidth energy width of electron bin, [eV]
          * @param densityElectrons [1/(m^3 * eV)], local superCell number density of electrons in this bin
+         * @param densitySlopeToNextBin forward electron-density slope, [1/(m^3 * eV^2)]
          * @param ionizationPotentialDepression eV
          * @param transitionCollectionIndex index of transition in boundBoundTransitionDataBox
          * @param atomicStateDataBox access to atomic state property data
@@ -231,6 +237,8 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
             float_X const energyElectronBinWidth,
             // 1/(sim.unit.length()^3*eV)
             float_X const densityElectrons,
+            // 1/(sim.unit.length()^3*eV^2)
+            float_X const densitySlopeToNextBin,
             // eV
             float_X const ionizationPotentialDepression,
             uint32_t const transitionCollectionIndex,
@@ -241,9 +249,31 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
             if constexpr(picongpu::atomicPhysics::debug::fixedRateMatrix::USE_FIXED_RATE_INSTEAD_OF_RATE_CALCULATION)
                 return 0._X;
 
+            // eV, may be repositioned by the threshold clip below
+            float_X energy = energyElectron;
+            // eV, may be shrunk by the threshold clip below
+            float_X binWidth = energyElectronBinWidth;
+            // 1/(sim.unit.length()^3*eV), may be reconstructed at the clipped midpoint
+            float_X density = densityElectrons;
+
+            if constexpr(useThresholdClippedBinIntegration)
+            {
+                // eV, IPD-shifted ionization threshold
+                float_X const energyDifference = picongpu::particles::atomicPhysics::DeltaEnergyTransition::get(
+                    transitionCollectionIndex,
+                    atomicStateDataBox,
+                    boundFreeTransitionDataBox,
+                    ionizationPotentialDepression,
+                    chargeStateDataBox);
+
+                // entire bin below threshold, no contribution
+                if(!thresholdClipBin(energy, binWidth, energyDifference, density, densitySlopeToNextBin))
+                    return 0._X;
+            }
+
             float_X sigma = collisionalIonizationCrossSection(
                 // eV
-                energyElectron,
+                energy,
                 ionizationPotentialDepression,
                 transitionCollectionIndex,
                 chargeStateDataBox,
@@ -251,9 +281,9 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
                 boundFreeTransitionDataBox); // [1e6*b]
 
             return picongpu::particles2::atomicPhysics::rateCalculation::collisionalRate(
-                energyElectron,
-                energyElectronBinWidth,
-                densityElectrons,
+                energy,
+                binWidth,
+                density,
                 sigma);
         }
 
@@ -263,8 +293,129 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
         /// @todo spontaneousRadiativeRecombinationCrossSection
         /// @todo rateSpontaneousRadiaitveRecombination
 
-        /// @todo threeBodyRecombinationCrossSection
-        /// @todo rateCollisionalThreeBodyRecombination
+        /** Saha-like detailed balance factor relating the three-body recombination rate of a bound-free transition
+         *  to the collisional ionization rate of the same transition, for Maxwellian electrons
+         *
+         * R_3BR = D * R_EII, with
+         *  D = g_lower/(2 * g_upper) * n_e * lambda_deBroglie^3(T_e) * exp(DeltaE/T_e)
+         *  lambda_deBroglie^3(T_e) = (2 * pi * hbar^2 / (m_e * T_e))^(3/2)
+         *
+         * equivalent to the SCFLY/FLYCHK convention
+         *  beta_3BR = 1.656415e-22 cm^3 / T_e[eV]^(3/2) * exp(DeltaE/T_e) * g_lower/g_upper * alpha_EII,
+         * with 1.656415e-22 cm^3 = lambda_deBroglie^3(1 eV) / 2.
+         *
+         * @attention Maxwellian approximation! The factor assumes the local electron spectrum is Maxwellian with
+         *  temperature T_e, in contrast to the histogram based collisional ionization rate.
+         *
+         * @param temperatureElectrons local electron temperature as k_B * T, [eV]
+         * @param densityElectrons local total electron number density, [1/sim.unit.length()^3]
+         * @param deltaEnergyTransition IPD-shifted energy difference of the transition, [eV]
+         * @param multiplicityLowerState statistical weight of the lower(recombined) atomic state
+         * @param multiplicityUpperState statistical weight of the upper(ionized) atomic state
+         *
+         * @return unitless, 0 for invalid input(T_e <= 0, n_e <= 0 or DeltaE <= 0)
+         */
+        HDINLINE static float_64 threeBodyDetailedBalanceFactor(
+            // eV
+            float_X const temperatureElectrons,
+            // 1/sim.unit.length()^3
+            float_X const densityElectrons,
+            // eV
+            float_X const deltaEnergyTransition,
+            float_64 const multiplicityLowerState,
+            float_64 const multiplicityUpperState)
+        {
+            /* barrier-free transitions (DeltaE <= 0, possible with strong IPD) have no defined detailed balance
+             *  factor, skip them like the collisional ionization cross section does */
+            if((temperatureElectrons <= 0._X) || (densityElectrons <= 0._X) || (deltaEnergyTransition <= 0._X))
+                return 0.;
+
+            // m^2 * eV, = 2 * pi * hbar^2 / (m_e * 1eV)
+            constexpr float_64 deBroglieFactor = 2. * picongpu::PI * pmacc::math::cPow(sim.si.getHbar(), 2u)
+                / (sim.si.getElectronMass() * sim.si.get_eV());
+            // sim.unit.length()^3 / m^3
+            constexpr float_64 volumeConversionFactor = 1. / pmacc::math::cPow(float_64(sim.unit.length()), 3u);
+
+            // m^3
+            float_64 const lambdaDeBroglieCubed
+                = math::pow(deBroglieFactor / static_cast<float_64>(temperatureElectrons), 1.5);
+
+            // cap exponent like SCFLY, prevents overflow at low temperature
+            float_64 const exponent = pmacc::math::min(
+                static_cast<float_64>(deltaEnergyTransition / temperatureElectrons),
+                500.);
+
+            /* unitless * 1/sim.unit.length()^3 * m^3 * sim.unit.length()^3/m^3 * unitless
+             * unit: unitless */
+            return 0.5 * multiplicityLowerState / multiplicityUpperState * static_cast<float_64>(densityElectrons)
+                * lambdaDeBroglieCubed * volumeConversionFactor * math::exp(exponent);
+        }
+
+        /** rate of collisional three-body recombination for a given bound-free transition
+         *
+         * Maxwellian detailed balance inverse of the collisional ionization rate of the same transition,
+         *  see threeBodyDetailedBalanceFactor() for the model and its limitations.
+         *
+         * @tparam T_ChargeStateDataBox instantiated type of dataBox
+         * @tparam T_AtomicStateDataBox instantiated type of dataBox
+         * @tparam T_BoundFreeTransitionDataBox instantiated type of dataBox
+         *
+         * @param temperatureElectrons local electron temperature as k_B * T, [eV]
+         * @param densityElectrons local total electron number density, [1/sim.unit.length()^3]
+         * @param sumRateCollisionalIonization collisional ionization rate of the same transition, summed over all
+         *  electron histogram bins, [1/sim.unit.time()]
+         * @param ionizationPotentialDepression eV
+         * @param transitionCollectionIndex index of transition in boundFreeTransitionDataBox
+         * @param chargeStateDataBox access to charge state property data
+         * @param atomicStateDataBox access to atomic state property data
+         * @param boundFreeTransitionDataBox access to bound-free transition data
+         *
+         * @return unit: 1/sim.unit.time()
+         */
+        template<typename T_ChargeStateDataBox, typename T_AtomicStateDataBox, typename T_BoundFreeTransitionDataBox>
+        HDINLINE static float_X rateCollisionalThreeBodyRecombinationTransition(
+            // eV
+            float_X const temperatureElectrons,
+            // 1/sim.unit.length()^3
+            float_X const densityElectrons,
+            // 1/sim.unit.time()
+            float_X const sumRateCollisionalIonization,
+            // eV
+            float_X const ionizationPotentialDepression,
+            uint32_t const transitionCollectionIndex,
+            T_ChargeStateDataBox const chargeStateDataBox,
+            T_AtomicStateDataBox const atomicStateDataBox,
+            T_BoundFreeTransitionDataBox const boundFreeTransitionDataBox)
+        {
+            if(sumRateCollisionalIonization <= 0._X)
+                return 0._X;
+
+            uint32_t const lowerStateClctIdx
+                = boundFreeTransitionDataBox.lowerStateCollectionIndex(transitionCollectionIndex);
+            uint32_t const upperStateClctIdx
+                = boundFreeTransitionDataBox.upperStateCollectionIndex(transitionCollectionIndex);
+
+            // eV, IPD-shifted, same threshold as in the collisional ionization cross section
+            float_X const energyDifference = picongpu::particles::atomicPhysics::DeltaEnergyTransition::get(
+                transitionCollectionIndex,
+                atomicStateDataBox,
+                boundFreeTransitionDataBox,
+                ionizationPotentialDepression,
+                chargeStateDataBox);
+
+            float_64 const rate = threeBodyDetailedBalanceFactor(
+                                      temperatureElectrons,
+                                      densityElectrons,
+                                      energyDifference,
+                                      static_cast<float_64>(atomicStateDataBox.multiplicity(lowerStateClctIdx)),
+                                      static_cast<float_64>(atomicStateDataBox.multiplicity(upperStateClctIdx)))
+                * static_cast<float_64>(sumRateCollisionalIonization);
+
+            // protect float_X cast, overlarge rates only force smaller atomicPhysics sub-steps
+            return static_cast<float_X>(
+                pmacc::math::min(rate, static_cast<float_64>(std::numeric_limits<float_X>::max())));
+        }
+
         /// @todo stimulatedRecombinationCrossSection
         /// @todo rateStimulatedRecombination
     };

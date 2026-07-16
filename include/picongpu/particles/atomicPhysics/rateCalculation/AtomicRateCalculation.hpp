@@ -25,3 +25,4 @@
 #include "picongpu/particles/atomicPhysics/rateCalculation/BoundBoundTransitionRates.hpp"
 #include "picongpu/particles/atomicPhysics/rateCalculation/BoundFreeCollisionalTransitionRates.hpp"
 #include "picongpu/particles/atomicPhysics/rateCalculation/BoundFreeFieldTransitionRates.hpp"
+#include "picongpu/particles/atomicPhysics/rateCalculation/BoundFreeRadiativeTransitionRates.hpp"

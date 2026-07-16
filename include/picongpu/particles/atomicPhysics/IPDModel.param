@@ -24,6 +24,10 @@
 #include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/RelativisticTemperatureFunctor.hpp"
 #include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/StewartPyattIPD.hpp"
 
+#ifndef PARAM_ATOMIC_PHYSICS_USE_NO_IPD
+#    define PARAM_ATOMIC_PHYSICS_USE_NO_IPD 0
+#endif
+
 namespace picongpu::atomicPhysics
 {
     /** switch for Stewart-Pyatt ionization potential depression model
@@ -33,8 +37,13 @@ namespace picongpu::atomicPhysics
      */
     constexpr bool useSCFLYextendedStewartPyattIPD = true;
 
+#if PARAM_ATOMIC_PHYSICS_USE_NO_IPD
+    //! configuration of used ionization potential depression Model
+    using IPDModel = picongpu::particles::atomicPhysics::ionizationPotentialDepression::NoIPD;
+#else
     //! configuration of used ionization potential depression Model
     using IPDModel = picongpu::particles::atomicPhysics::ionizationPotentialDepression::StewartPyattIPD<
         picongpu::particles::atomicPhysics::ionizationPotentialDepression::RelativisticTemperatureFunctor,
         useSCFLYextendedStewartPyattIPD>;
+#endif
 } // namespace picongpu::atomicPhysics

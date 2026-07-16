@@ -32,6 +32,7 @@
 #include "picongpu/particles/atomicPhysics/debug/param.hpp"
 #include "picongpu/particles/atomicPhysics/rateCalculation/CollisionalRate.hpp"
 #include "picongpu/particles/atomicPhysics/rateCalculation/Multiplicities.hpp"
+#include "picongpu/particles/atomicPhysics/rateCalculation/ThresholdClip.hpp"
 
 #include <pmacc/algorithms/math.hpp>
 
@@ -295,7 +296,9 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
 
         /** rate for collisional bound-bound transition of ion with free electron bin
          *
-         * uses second order integration(bin middle)
+         * uses second order integration(bin middle); for excitation with
+         * useThresholdClippedBinIntegration the bin straddling the transition threshold
+         * is clipped to its above-threshold sub-interval, see ThresholdClip.hpp
          *
          * @todo implement higher order integrations, Brian Marre, 2022
          *
@@ -306,6 +309,7 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
          * @param energyElectron kinetic energy of interacting electron(/electron bin), [eV]
          * @param energyElectronBinWidth energy width of electron bin, [eV]
          * @param densityElectrons [1/(m^3 * eV)]
+         * @param densitySlopeToNextBin forward electron-density slope, [1/(m^3 * eV^2)]
          * @param transitionCollectionIndex index of transition in boundBoundTransitionDataBox
          * @param atomicStateDataBox access to atomic state property data
          * @param boundBoundTransitionDataBox access to bound-bound transition data
@@ -317,6 +321,7 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
             float_X const energyElectron, // [eV]
             float_X const energyElectronBinWidth, // [eV]
             float_X const densityElectrons, // [1/(sim.unit.length()^3*eV)]
+            float_X const densitySlopeToNextBin, // [1/(sim.unit.length()^3*eV^2)]
             uint32_t const transitionCollectionIndex,
             T_AtomicStateDataBox const atomicStateDataBox,
             T_BoundBoundTransitionDataBox const boundBoundTransitionDataBox)
@@ -326,19 +331,41 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
                            transitionCollectionIndex)
                        / float_X(picongpu::atomicPhysics::ElectronHistogram::numberBins);
 
+            // eV, may be repositioned by the threshold clip below
+            float_X energy = energyElectron;
+            // eV, may be shrunk by the threshold clip below
+            float_X binWidth = energyElectronBinWidth;
+            // 1/(sim.unit.length()^3*eV), may be reconstructed at the clipped midpoint
+            float_X density = densityElectrons;
+
+            // only excitation has an electron energy threshold, deexcitation does not
+            if constexpr(T_excitation && useThresholdClippedBinIntegration)
+            {
+                // eV
+                float_X const energyDifference = picongpu::particles::atomicPhysics::DeltaEnergyTransition ::
+                    get<T_AtomicStateDataBox, T_BoundBoundTransitionDataBox>(
+                        transitionCollectionIndex,
+                        atomicStateDataBox,
+                        boundBoundTransitionDataBox);
+
+                // entire bin below threshold, no contribution
+                if(!thresholdClipBin(energy, binWidth, energyDifference, density, densitySlopeToNextBin))
+                    return 0._X;
+            }
+
             float_X const sigma = collisionalBoundBoundCrossSection<
                 T_AtomicStateDataBox,
                 T_BoundBoundTransitionDataBox,
                 T_excitation>(
-                energyElectron, // [eV]
+                energy, // [eV]
                 transitionCollectionIndex,
                 atomicStateDataBox,
                 boundBoundTransitionDataBox); // [1e6*b]
 
             float_X const result = picongpu::particles2::atomicPhysics::rateCalculation::collisionalRate(
-                energyElectron,
-                energyElectronBinWidth,
-                densityElectrons,
+                energy,
+                binWidth,
+                density,
                 sigma);
 
             if(result < 0._X)

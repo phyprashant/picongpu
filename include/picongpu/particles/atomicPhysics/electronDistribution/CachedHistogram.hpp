@@ -70,6 +70,65 @@ namespace picongpu::particles::atomicPhysics::kernel
                 });
             worker.sync();
         }
+
+        /** finite-difference density slope towards the next higher-energy bin
+         *
+         * Used by threshold-bin integration to reconstruct the electron density
+         * at a sample shifted above the original bin center. The last bin has no
+         * upper neighbour and therefore falls back to a constant density.
+         *
+         * @param idx regular histogram-bin index
+         * @return density slope, [1/(sim.unit.length()^3 * eV^2)]
+         */
+        HDINLINE float_X densitySlopeToNextBin(uint32_t const idx) const
+        {
+            if(idx + 1u >= T_size)
+                return 0._X;
+
+            float_X const energyDifference = energy[idx + 1u] - energy[idx];
+            if(energyDifference <= 0._X)
+                return 0._X;
+
+            return (density[idx + 1u] - density[idx]) / energyDifference;
+        }
+
+        /** total electron number density of the histogram
+         *
+         * @attention does not include the overflow bin
+         *
+         * @return unit: 1/sim.unit.length()^3
+         */
+        HDINLINE float_X electronDensity() const
+        {
+            float_X result = 0._X;
+            for(uint32_t idx = 0u; idx < T_size; ++idx)
+                result += density[idx] * binWidth[idx];
+            return result;
+        }
+
+        /** effective electron temperature of the histogram as k_B * T
+         *
+         * classical ideal gas estimator, T = 2/3 * <E_kin>, valid for non-relativistic electron spectra only
+         *
+         * @attention does not include the overflow bin
+         *
+         * @return unit: eV, 0 if histogram is empty
+         */
+        HDINLINE float_X temperatureEnergy() const
+        {
+            float_X sumWeight = 0._X;
+            float_X sumEnergy = 0._X;
+            for(uint32_t idx = 0u; idx < T_size; ++idx)
+            {
+                float_X const binDensity = density[idx] * binWidth[idx];
+                sumWeight += binDensity;
+                sumEnergy += binDensity * energy[idx];
+            }
+
+            if(sumWeight <= 0._X)
+                return 0._X;
+            return 2._X / 3._X * sumEnergy / sumWeight;
+        }
     };
 
 
