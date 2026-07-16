@@ -1,4 +1,4 @@
-/* Copyright 2023-2024 Brian Marre
+/* Copyright 2023-2026 Brian Marre, Prashant Sharma
  *
  * This file is part of PIConGPU.
  *
@@ -17,17 +17,17 @@
  * If not, see <http://www.gnu.org/licenses/>.
  */
 
-/** @file decelerate electrons sub-stage of atomicPhysics
+/** @file apply electron capture sub-stage of atomicPhysics
  *
- * implements heating/reduction of momentum of all electron species due to accepted
- *  atomicPhysics transition
+ * removes electron weight captured by recombination processes, e.g. three-body recombination, from the free
+ *  electron macro particles of all electron species
  */
 
 #pragma once
 
 #include "picongpu/defines.hpp"
 #include "picongpu/particles/atomicPhysics/electronDistribution/LocalHistogramField.hpp"
-#include "picongpu/particles/atomicPhysics/kernel/DecelerateElectrons.kernel"
+#include "picongpu/particles/atomicPhysics/kernel/ApplyElectronCapture.kernel"
 #include "picongpu/particles/atomicPhysics/localHelperFields/CapturedWeightCacheField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/TimeRemainingField.hpp"
 #include "picongpu/particles/param.hpp"
@@ -43,15 +43,15 @@ namespace picongpu::particles::atomicPhysics::stage
 {
     /** @class atomicPhysics sub-stage for a species calling the kernel per superCell
      *
-     * is called once per time step for the entire local simulation volume and for
-     * every isElectron species by the atomicPhysics stage by the atomicPhysicsStage
+     * is called once per atomicPhysics sub-step for the entire local simulation volume and for
+     * every isElectron species by the atomicPhysics stage
      *
      * @attention assumes RecordChanges atomicPhysics sub-stage to have been executed previously
      *
      * @tparam T_ElectronSpecies species for which to call the functor
      */
     template<typename T_ElectronSpecies>
-    struct DecelerateElectrons
+    struct ApplyElectronCapture
     {
         // might be alias, from here on out no more
         //! resolved type of alias T_ElectronSpecies
@@ -68,8 +68,6 @@ namespace picongpu::particles::atomicPhysics::stage
                 picongpu::particles::atomicPhysics::localHelperFields::TimeRemainingField<picongpu::MappingDesc>>(
                 "TimeRemainingField");
 
-            // pointer to memory, we will only work on device, no sync required
-            // init pointer to electrons and electronHistogramField
             auto& electrons = *dc.get<ElectronSpecies>(ElectronSpecies::FrameType::getName());
             auto& electronHistogramField
                 = *dc.get<picongpu::particles::atomicPhysics::electronDistribution::
@@ -79,17 +77,19 @@ namespace picongpu::particles::atomicPhysics::stage
                 = *dc.get<picongpu::particles::atomicPhysics::localHelperFields::CapturedWeightCacheField<
                     picongpu::MappingDesc>>("CapturedWeightCacheField");
 
-            using DecelerateElectrons = picongpu::particles::atomicPhysics::kernel ::
-                DecelerateElectronsKernel<ElectronSpecies, picongpu::atomicPhysics::ElectronHistogram>;
+            using ApplyElectronCaptureKernel = picongpu::particles::atomicPhysics::kernel::
+                ApplyElectronCaptureKernel<ElectronSpecies, picongpu::atomicPhysics::ElectronHistogram>;
 
-            // macro for call of kernel on every superCell, see pull request #4321
-            PMACC_LOCKSTEP_KERNEL(DecelerateElectrons())
+            PMACC_LOCKSTEP_KERNEL(ApplyElectronCaptureKernel())
                 .config(mapper.getGridDim(), electrons)(
                     mapper,
                     timeRemainingField.getDeviceDataBox(),
                     electrons.getDeviceParticlesBox(),
                     electronHistogramField.getDeviceDataBox(),
                     capturedWeightCacheField.getDeviceDataBox());
+
+            // remove the gaps left by macro electrons deleted due to falling below MIN_WEIGHTING
+            electrons.fillAllGaps();
         }
     };
 } // namespace picongpu::particles::atomicPhysics::stage

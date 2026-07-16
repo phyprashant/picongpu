@@ -30,6 +30,7 @@
 #include <pmacc/static_assert.hpp>
 
 #include <cstdint>
+#include <fstream>
 
 namespace picongpu::particles::atomicPhysics::localHelperFields
 {
@@ -47,11 +48,25 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
         /// @note -1 since we never store noChange, since noChange is always reminder to 1
         static constexpr uint32_t numberStoredDataSets
             = particles::atomicPhysics::enums::numberChooseTransitionGroups - 1u;
+        /* Prashant
+         */
+        static constexpr uint32_t numberPairRateEntries
+            = picongpu::atomicPhysics::debug::rateCache::PRINT_TO_CONSOLE ? numberAtomicStates * numberAtomicStates
+                                                                          : 1u;
+        /*
+         */
 
     private:
         // partial sums of rates for each atomic state, one for each ChooseTransitionGroup except noChange
         // 1/sim.unit.time()
         float_X rateEntries[numberAtomicStates * numberStoredDataSets] = {0._X};
+        /* Prashant
+         */
+        float_X boundBoundCollisionalPairRateEntries[numberPairRateEntries] = {0._X};
+        float_X boundFreeCollisionalPairRateEntries[numberPairRateEntries] = {0._X};
+        float_X boundFreeRadiativePairRateEntries[numberPairRateEntries] = {0._X};
+        /*
+         */
         // unitless
         uint32_t m_present[numberAtomicStates] = {static_cast<uint32_t>(false)};
 
@@ -72,6 +87,23 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
             }
             return numberStoredDataSets * collectionIndex + dataSetIndex;
         }
+
+        /* Prashant
+         */
+        static constexpr uint32_t pairLinearIndex(uint32_t const sourceCollectionIndex, uint32_t const targetCollectionIndex)
+        {
+            if constexpr(picongpu::atomicPhysics::debug::rateCache::COLLECTION_INDEX_RANGE_CHECKS)
+            {
+                if((sourceCollectionIndex >= numberAtomicStates) || (targetCollectionIndex >= numberAtomicStates))
+                {
+                    printf("atomicPhysics ERROR: out of range pairLinearIndex() call to rateCache\n");
+                    return 0u;
+                }
+            }
+            return numberAtomicStates * sourceCollectionIndex + targetCollectionIndex;
+        }
+        /*
+         */
 
         template<particles::atomicPhysics::enums::ChooseTransitionGroup T_ChooseTransitionGroup>
         static constexpr bool checkIsStoredChooseTransitionGroup()
@@ -139,6 +171,91 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
             rateEntries[linearIndex(collectionIndex, u32(T_ChooseTransitionGroup))] += rate;
             return;
         }
+
+        /* Prashant
+         */
+        template<typename T_Worker>
+        HDINLINE void addBoundBoundPairRate(
+            T_Worker const& worker,
+            uint32_t const sourceCollectionIndex,
+            uint32_t const targetCollectionIndex,
+            float_X const rate)
+        {
+            if constexpr(picongpu::atomicPhysics::debug::rateCache::PRINT_TO_CONSOLE)
+                alpaka::atomicAdd(
+                    worker.getAcc(),
+                    &(this->boundBoundCollisionalPairRateEntries[pairLinearIndex(
+                        sourceCollectionIndex,
+                        targetCollectionIndex)]),
+                    rate,
+                    ::alpaka::hierarchy::Threads{});
+        }
+
+        HDINLINE void addBoundBoundPairRate(
+            uint32_t const sourceCollectionIndex,
+            uint32_t const targetCollectionIndex,
+            float_X const rate)
+        {
+            if constexpr(picongpu::atomicPhysics::debug::rateCache::PRINT_TO_CONSOLE)
+                boundBoundCollisionalPairRateEntries[pairLinearIndex(sourceCollectionIndex, targetCollectionIndex)]
+                    += rate;
+        }
+
+        template<typename T_Worker>
+        HDINLINE void addBoundFreePairRate(
+            T_Worker const& worker,
+            uint32_t const sourceCollectionIndex,
+            uint32_t const targetCollectionIndex,
+            float_X const rate)
+        {
+            if constexpr(picongpu::atomicPhysics::debug::rateCache::PRINT_TO_CONSOLE)
+                alpaka::atomicAdd(
+                    worker.getAcc(),
+                    &(this->boundFreeCollisionalPairRateEntries[pairLinearIndex(
+                        sourceCollectionIndex,
+                        targetCollectionIndex)]),
+                    rate,
+                    ::alpaka::hierarchy::Threads{});
+        }
+
+        HDINLINE void addBoundFreePairRate(
+            uint32_t const sourceCollectionIndex,
+            uint32_t const targetCollectionIndex,
+            float_X const rate)
+        {
+            if constexpr(picongpu::atomicPhysics::debug::rateCache::PRINT_TO_CONSOLE)
+                boundFreeCollisionalPairRateEntries[pairLinearIndex(sourceCollectionIndex, targetCollectionIndex)]
+                    += rate;
+        }
+
+        template<typename T_Worker>
+        HDINLINE void addBoundFreeRadiativePairRate(
+            T_Worker const& worker,
+            uint32_t const sourceCollectionIndex,
+            uint32_t const targetCollectionIndex,
+            float_X const rate)
+        {
+            if constexpr(picongpu::atomicPhysics::debug::rateCache::PRINT_TO_CONSOLE)
+                alpaka::atomicAdd(
+                    worker.getAcc(),
+                    &(this->boundFreeRadiativePairRateEntries[pairLinearIndex(
+                        sourceCollectionIndex,
+                        targetCollectionIndex)]),
+                    rate,
+                    ::alpaka::hierarchy::Threads{});
+        }
+
+        HDINLINE void addBoundFreeRadiativePairRate(
+            uint32_t const sourceCollectionIndex,
+            uint32_t const targetCollectionIndex,
+            float_X const rate)
+        {
+            if constexpr(picongpu::atomicPhysics::debug::rateCache::PRINT_TO_CONSOLE)
+                boundFreeRadiativePairRateEntries[pairLinearIndex(sourceCollectionIndex, targetCollectionIndex)]
+                    += rate;
+        }
+        /*
+         */
 
         /** set indicator if atomic state is present
          *
@@ -246,7 +363,7 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
             -> std::enable_if_t<std::is_same_v<alpaka::Dev<T_Acc>, alpaka::DevCpu>>
         {
             std::cout << "rateCache" << superCellFieldIdx.toString(",", "[]")
-                      << " atomicStateCollectionIndex [bb(up), bb(down), col.bf(up), a(down), f.bf(up)]" << std::endl;
+                      << " atomicStateCollectionIndex [bb(up), bb(down), col.bf(up), a(down), f.bf(up), col.bf(down), rad.bf(down)]" << std::endl;
             for(uint32_t collectionIndex = 0u; collectionIndex < numberAtomicStates; ++collectionIndex)
             {
                 if(this->present(collectionIndex))
@@ -270,6 +387,88 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
         HDINLINE auto printToConsole(T_Acc const&, pmacc::DataSpace<picongpu::simDim> superCellFieldIdx) const
             -> std::enable_if_t<!std::is_same_v<alpaka::Dev<T_Acc>, alpaka::DevCpu>>
         {
+        }
+
+        //! host-only write content of rate cache to an ofstream, works with any backend
+        HINLINE void printToFile(
+            std::ofstream& out,
+            pmacc::DataSpace<picongpu::simDim> const superCellFieldIdx) const
+        {
+            out << "rateCache" << superCellFieldIdx.toString(",", "[]")
+                << " atomicStateCollectionIndex [bb(up), bb(down), col.bf(up), a(down), f.bf(up), col.bf(down), rad.bf(down)]" << std::endl;
+            for(uint32_t collectionIndex = 0u; collectionIndex < numberAtomicStates; ++collectionIndex)
+            {
+                if(this->present(collectionIndex))
+                {
+                    out << "\t" << collectionIndex << "[";
+                    for(uint32_t chooseTransitionGroupIndex = 0u;
+                        chooseTransitionGroupIndex < (numberStoredDataSets - 1u);
+                        ++chooseTransitionGroupIndex)
+                    {
+                        out << rateEntries[linearIndex(collectionIndex, chooseTransitionGroupIndex)] << ", ";
+                    }
+                    // last dataSet
+                    out << rateEntries[linearIndex(collectionIndex, numberStoredDataSets - 1u)] << "]"
+                        << std::endl;
+                }
+            }
+            /* Prashant
+             */
+            out << "boundBoundCollisionalTransitionRates" << superCellFieldIdx.toString(",", "[]")
+                << " [sourceAtomicStateCollectionIndex,targetAtomicStateCollectionIndex,totalRate]" << std::endl;
+            for(uint32_t sourceCollectionIndex = 0u; sourceCollectionIndex < numberAtomicStates; ++sourceCollectionIndex)
+            {
+                for(uint32_t targetCollectionIndex = 0u; targetCollectionIndex < numberAtomicStates; ++targetCollectionIndex)
+                {
+                    float_X const rate
+                        = boundBoundCollisionalPairRateEntries[pairLinearIndex(
+                            sourceCollectionIndex,
+                            targetCollectionIndex)];
+                    if(rate != 0._X)
+                    {
+                        out << "\t" << sourceCollectionIndex << " " << targetCollectionIndex << " " << rate
+                            << std::endl;
+                    }
+                }
+            }
+
+            out << "boundFreeCollisionalTransitionRates" << superCellFieldIdx.toString(",", "[]")
+                << " [sourceAtomicStateCollectionIndex,targetAtomicStateCollectionIndex,totalRate]" << std::endl;
+            for(uint32_t sourceCollectionIndex = 0u; sourceCollectionIndex < numberAtomicStates; ++sourceCollectionIndex)
+            {
+                for(uint32_t targetCollectionIndex = 0u; targetCollectionIndex < numberAtomicStates; ++targetCollectionIndex)
+                {
+                    float_X const rate
+                        = boundFreeCollisionalPairRateEntries[pairLinearIndex(
+                            sourceCollectionIndex,
+                            targetCollectionIndex)];
+                    if(rate != 0._X)
+                    {
+                        out << "\t" << sourceCollectionIndex << " " << targetCollectionIndex << " " << rate
+                            << std::endl;
+                    }
+                }
+            }
+
+            out << "boundFreeRadiativeTransitionRates" << superCellFieldIdx.toString(",", "[]")
+                << " [sourceAtomicStateCollectionIndex,targetAtomicStateCollectionIndex,totalRate]" << std::endl;
+            for(uint32_t sourceCollectionIndex = 0u; sourceCollectionIndex < numberAtomicStates; ++sourceCollectionIndex)
+            {
+                for(uint32_t targetCollectionIndex = 0u; targetCollectionIndex < numberAtomicStates; ++targetCollectionIndex)
+                {
+                    float_X const rate
+                        = boundFreeRadiativePairRateEntries[pairLinearIndex(
+                            sourceCollectionIndex,
+                            targetCollectionIndex)];
+                    if(rate != 0._X)
+                    {
+                        out << "\t" << sourceCollectionIndex << " " << targetCollectionIndex << " " << rate
+                            << std::endl;
+                    }
+                }
+            }
+            /*
+             */
         }
     };
 } // namespace picongpu::particles::atomicPhysics::localHelperFields

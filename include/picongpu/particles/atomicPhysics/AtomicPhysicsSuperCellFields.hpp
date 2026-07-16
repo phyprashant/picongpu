@@ -22,6 +22,7 @@
 #include "picongpu/defines.hpp"
 #include "picongpu/particles/atomicPhysics/ParticleType.hpp"
 #include "picongpu/particles/atomicPhysics/electronDistribution/LocalHistogramField.hpp"
+#include "picongpu/particles/atomicPhysics/localHelperFields/CapturedWeightCacheField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/FieldEnergyUseCacheField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/FoundUnboundIonField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/RejectionProbabilityCacheField_Bin.hpp"
@@ -98,6 +99,11 @@ namespace picongpu::particles::atomicPhysics
             auto superCellFieldEnergyUseCacheField
                 = std::make_unique<localHelperFields::FieldEnergyUseCacheField<picongpu::MappingDesc>>(mappingDesc);
             dataConnector.consume(std::move(superCellFieldEnergyUseCacheField));
+
+            // local cache of electron weight captured by recombination processes
+            auto superCellCapturedWeightCacheField
+                = std::make_unique<localHelperFields::CapturedWeightCacheField<picongpu::MappingDesc>>(mappingDesc);
+            dataConnector.consume(std::move(superCellCapturedWeightCacheField));
         }
     };
 } // namespace picongpu::particles::atomicPhysics

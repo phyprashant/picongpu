@@ -130,9 +130,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                     uint32_t const binIndex = linearIdx / T_numberAtomicStates;
                     uint32_t const atomicStateCollectionIndex = linearIdx % T_numberAtomicStates;
 
-                    // check if atomic state present at all
-                    if(!rateCache.present(atomicStateCollectionIndex))
-                        return;
+                    bool const atomicStatePresent = rateCache.present(atomicStateCollectionIndex);
 
                     uint32_t const numberTransitionsUp
                         = numberTransitionsDataBox.numberOfTransitionsUp(atomicStateCollectionIndex);
@@ -141,6 +139,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                     float_X const energy = cachedHistogram.energy[binIndex];
                     float_X const binWidth = cachedHistogram.binWidth[binIndex];
                     float_X const density = cachedHistogram.density[binIndex];
+                    float_X const densitySlopeToNextBin = cachedHistogram.densitySlopeToNextBin(binIndex);
 
                     // eV
                     float_X const ionizationPotentialDepression
@@ -156,8 +155,8 @@ namespace picongpu::particles::atomicPhysics::kernel
                         uint32_t const transitionCollectionIndex = offset + transitionID;
 
                         // 1/ picongpu::sim.unit.time()
-                        sumRateTransitions
-                            += atomicPhysics::rateCalculation::BoundFreeCollisionalTransitionRates<T_numberLevels>::
+                        float_X const transitionRate
+                            = atomicPhysics::rateCalculation::BoundFreeCollisionalTransitionRates<T_numberLevels>::
                                 template rateCollisionalIonizationTransition<
                                     T_ChargeStateDataDataBox,
                                     T_AtomicStateDataDataBox,
@@ -165,17 +164,29 @@ namespace picongpu::particles::atomicPhysics::kernel
                                     energy,
                                     binWidth,
                                     density,
+                                    densitySlopeToNextBin,
                                     ionizationPotentialDepression,
                                     transitionCollectionIndex,
                                     chargeStateDataDataBox,
                                     atomicStateDataDataBox,
                                     boundFreeTransitionDataBox);
+                        sumRateTransitions += transitionRate;
+                        uint32_t const lowerStateCollectionIndex
+                            = boundFreeTransitionDataBox.lowerStateCollectionIndex(transitionCollectionIndex);
+                        uint32_t const upperStateCollectionIndex
+                            = boundFreeTransitionDataBox.upperStateCollectionIndex(transitionCollectionIndex);
+                        rateCache.addBoundFreePairRate(
+                            worker,
+                            lowerStateCollectionIndex,
+                            upperStateCollectionIndex,
+                            transitionRate);
                     }
 
-                    rateCache.template add<T_Worker, s_enums::ChooseTransitionGroup::collisionalBoundFreeUpward>(
-                        worker,
-                        atomicStateCollectionIndex,
-                        sumRateTransitions);
+                    if(atomicStatePresent)
+                        rateCache.template add<T_Worker, s_enums::ChooseTransitionGroup::collisionalBoundFreeUpward>(
+                            worker,
+                            atomicStateCollectionIndex,
+                            sumRateTransitions);
                 });
         }
 

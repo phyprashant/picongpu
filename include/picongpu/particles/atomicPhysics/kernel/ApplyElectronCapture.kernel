@@ -1,0 +1,145 @@
+/* Copyright 2023-2026 Brian Marre, Prashant Sharma
+ *
+ * This file is part of PIConGPU.
+ *
+ * PIConGPU is free software you can redistribute it and or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * PIConGPU is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with PIConGPU.
+ * If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/** @file remove electron weight captured by recombination processes from the free electron macro particles
+ *
+ * Statistical mean field capture model: each macro electron of a histogram bin is reweighted by the bin's captured
+ *  weight fraction, instead of removing individual macro electrons. This conserves charge and electron number in
+ *  aggregate per bin, but is not a resolved three-particle collision.
+ */
+
+#pragma once
+
+#include "picongpu/defines.hpp"
+#include "picongpu/particles/atomicPhysics/GetPhysicalEnergy.hpp"
+
+#include <pmacc/particles/algorithm/ForEach.hpp>
+
+#include <cstdint>
+
+namespace picongpu::particles::atomicPhysics::kernel
+{
+    /** apply electron capture kernel
+     *
+     * @attention assumes that the captured weight cache has been filled by the RecordChanges sub-stage previously
+     * @attention must run before the DecelerateElectrons sub-stage: electron energies are then still unchanged
+     *  since the histogram binning, so each electron's bin lookup matches the bin the captured weight was selected
+     *  and reserved from
+     *
+     * called by ApplyElectronCapture sub-stage, reduces the weighting of all macro electrons of the species
+     *  T_Electron in the given superCell by their bin's captured weight fraction and marks macro electrons falling
+     *  below MIN_WEIGHTING for deletion. The macro particle momentum is weight-scaled and therefore reduced by the
+     *  same fraction, keeping the per physical electron energy unchanged.
+     */
+    template<typename T_Electron, typename T_Histogram>
+    struct ApplyElectronCaptureKernel
+    {
+        /** call operator
+         *
+         * called by ApplyElectronCapture atomic physics sub-stage
+         *
+         * @param worker object containing the device and block
+         *  information, passed by PMACC_KERNEL call
+         * @param areMapping mapping of blockIndex to block superCell index
+         * @param timeRemainingBox deviceDataBox giving access to the local time remaining of all local super
+         * cells
+         * @param electronBox deviceDataBox giving access to the electron species particle frames
+         *   of all local superCells
+         * @param electronHistogramDataBox deviceDataBox giving access to the
+         *  local electron histograms of all local superCells
+         * @param capturedWeightCacheBox deviceDataBox giving access to the captured weight cache of all local
+         *  superCells
+         */
+        template<
+            typename T_Worker,
+            typename T_AreaMapping,
+            typename T_LocalTimeRemainingBox,
+            typename T_ElectronBox,
+            typename T_LocalElectronHistogramDataBox,
+            typename T_LocalCapturedWeightCacheBox>
+        HDINLINE void operator()(
+            T_Worker const& worker,
+            T_AreaMapping const areaMapping,
+            T_LocalTimeRemainingBox const timeRemainingBox,
+            T_ElectronBox electronBox,
+            T_LocalElectronHistogramDataBox electronHistogramDataBox,
+            T_LocalCapturedWeightCacheBox capturedWeightCacheBox) const
+        {
+            pmacc::DataSpace<simDim> const superCellIdx = areaMapping.getSuperCellIndex(worker.blockDomIdxND());
+
+            // atomicPhysics superCellFields have no guard, but areMapping includes a guard
+            //  -> must subtract guard to get correct superCellFieldIdx
+            pmacc::DataSpace<picongpu::simDim> const superCellFieldIdx
+                = superCellIdx - areaMapping.getGuardingSuperCells();
+
+            auto const timeRemaining = timeRemainingBox(superCellFieldIdx);
+
+            auto forEachLocalElectronBoxEntry
+                = pmacc::particles::algorithm::acc::makeForEach(worker, electronBox, superCellIdx);
+
+            // end kernel if superCell already finished or if contains no particles
+            if((timeRemaining <= 0._X) || (!forEachLocalElectronBoxEntry.hasParticles()))
+                return;
+
+            T_Histogram& histogram = electronHistogramDataBox(superCellFieldIdx);
+            auto& capturedWeightCache = capturedWeightCacheBox(superCellFieldIdx);
+
+            forEachLocalElectronBoxEntry(
+                [&histogram, &capturedWeightCache](T_Worker const& worker, auto& electron)
+                {
+                    // eV
+                    float_X const energyElectron = GetPhysicalEnergy::KineticEnergy(electron);
+
+                    // no corresponding bin exists
+                    if(!histogram.inRange(energyElectron))
+                        return;
+
+                    uint32_t const binIndex = histogram.getBinIndex(energyElectron);
+
+                    // unitless
+                    float_X const capturedWeightBin = capturedWeightCache.getCapturedWeight(binIndex);
+                    if(capturedWeightBin <= 0._X)
+                        return;
+
+                    // unitless
+                    float_X const weightBin = histogram.getBinWeight0(binIndex);
+                    if(weightBin <= 0._X)
+                        return;
+
+                    /* over subscription handling guarantees capturedWeight <= deltaWeight <= weight0, clamp against
+                     *  float rounding */
+                    float_X const captureFraction = pmacc::math::min(capturedWeightBin / weightBin, 1._X);
+
+                    float_X const newWeighting = electron[weighting_] * (1._X - captureFraction);
+
+                    if(newWeighting < picongpu::particles::MIN_WEIGHTING)
+                    {
+                        /* mark macro electron for deletion, host side stage must call fillAllGaps() afterwards,
+                         *  residual weight below MIN_WEIGHTING is accepted leakage */
+                        electron[multiMask_] = 0;
+                        return;
+                    }
+
+                    electron[weighting_] = newWeighting;
+                    // momentum is weight-scaled, rescale to keep the per physical electron energy unchanged
+                    electron[momentum_] *= (1._X - captureFraction);
+                });
+        }
+    };
+} // namespace picongpu::particles::atomicPhysics::kernel

@@ -1,4 +1,4 @@
-/* Copyright 2023-2025 Brian Marre
+/* Copyright 2023-2026 Brian Marre, Prashant Sharma
  *
  * This file is part of PIConGPU.
  *
@@ -29,6 +29,7 @@
 #include "picongpu/particles/atomicPhysics/enums/TransitionDirection.hpp"
 #include "picongpu/particles/atomicPhysics/enums/TransitionOrderingFor.hpp"
 #include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/GetIPD.hpp"
+#include "picongpu/particles/atomicPhysics/kernel/UpdateIon.hpp"
 #include "picongpu/particles/atomicPhysics/rateCalculation/BoundFreeCollisionalTransitionRates.hpp"
 
 #include <pmacc/memory/shared/Allocate.hpp>
@@ -41,18 +42,24 @@ namespace picongpu::particles::atomicPhysics::kernel
 {
     namespace s_enums = picongpu::particles::atomicPhysics::enums;
 
-    /** choose specific transition from previously selected transitionType for bound-free collisional transitions
+    /** choose specific transition from previously selected transitionType for downward bound-free collisional
+     *  transitions, i.e. three-body recombination
      *
      * A transition is selected by rolling a random number r, [0,1) and comparing it to the cumulative sums of the
      *  normalized rates of the physical transitions of the transitionType.
      * The transition corresponding to the interval containing r is the chosen and accepted.
+     *
+     * In addition a capture bin is selected for the captured electron, with each bin weighted by its share of the
+     *  local electron weight, i.e. uniform capture probability per physical free electron.
+     * @attention Maxwellian model approximation! A microreversible model would instead prefer capturing low energy
+     *  electrons, this requires a differential ionization cross section and is not implemented yet.
      *
      * @tparam T_Histogram type of the histogram
      * @tparam T_n_max number of levels of atomic states in input
      * @tparam T_IPDModel ionization potential depression model to use
      */
     template<typename T_Histogram, uint8_t T_n_max, typename T_IPDModel>
-    struct ChooseTransitionKernel_CollisionalBoundFree
+    struct ChooseTransitionKernel_CollisionalBoundFreeDownward
     {
         template<
             typename T_AtomicStateBoundFreeStartIndexBlockDataBox,
@@ -74,7 +81,7 @@ namespace picongpu::particles::atomicPhysics::kernel
             PMACC_CASSERT_MSG(
                 wrong_transition_ordering_boundFreeTransitionDataBox,
                 u8(T_BoundFreeTransitionDataBox::transitionOrdering)
-                    == u8(s_enums::TransitionOrderingFor<s_enums::TransitionDirection::upward>::ordering));
+                    == u8(s_enums::TransitionOrderingFor<s_enums::TransitionDirection::downward>::ordering));
             return true;
         }
 
@@ -162,17 +169,28 @@ namespace picongpu::particles::atomicPhysics::kernel
             PMACC_SMEM(worker, cachedHistogram, CachedHistogram<T_Histogram::numberBins>);
             cachedHistogram.fill(worker, electronHistogram, volumeScalingFactor);
 
+            // 1/sim.unit.length()^3
+            PMACC_SMEM(worker, densityElectrons, float_X);
+            // eV
+            PMACC_SMEM(worker, temperatureElectrons, float_X);
             PMACC_SMEM(worker, superCellConstantIPDInput, typename T_IPDModel::SuperCellConstantInput);
 
             auto onlyMaster = lockstep::makeMaster(worker);
             onlyMaster(
-                [&superCellConstantIPDInput, &superCellFieldIdx, &ipdInput...]()
+                [&superCellConstantIPDInput,
+                 &densityElectrons,
+                 &temperatureElectrons,
+                 &cachedHistogram,
+                 &superCellFieldIdx,
+                 &ipdInput...]()
                 {
                     superCellConstantIPDInput = T_IPDModel::getSuperCellConstantInput(superCellFieldIdx, ipdInput...);
+                    densityElectrons = cachedHistogram.electronDensity();
+                    temperatureElectrons = cachedHistogram.temperatureEnergy();
                 });
             worker.sync();
 
-            // check whether collisional bound-free transition and if yes, roll specific transition and bin
+            // check whether downward collisional bound-free transition and if yes, roll specific transition and bin
             forEachLocalIonBoxEntry(
                 [&rngGeneratorFloat,
                  &chargeStateDataDataBox,
@@ -182,34 +200,33 @@ namespace picongpu::particles::atomicPhysics::kernel
                  &transitionDataBox,
                  &cachedHistogram,
                  &rateCache,
+                 &densityElectrons,
+                 &temperatureElectrons,
                  &superCellConstantIPDInput](T_Worker const& worker, auto& ion)
                 {
                     // debug
                     checkForInvalidChooseTransitionGroup(ion);
 
                     // reject already accepted macro-ions and other transitionTypes
-                    bool const selectedCollisionalBoundFreeUpwardTransition
-                        = (ion[transitionIndex_] == u32(s_enums::ChooseTransitionGroup::collisionalBoundFreeUpward));
-                    if(ion[accepted_] || !selectedCollisionalBoundFreeUpwardTransition)
+                    bool const selectedCollisionalBoundFreeDownwardTransition
+                        = (ion[transitionIndex_]
+                           == u32(s_enums::ChooseTransitionGroup::collisionalBoundFreeDownward));
+                    if(ion[accepted_] || !selectedCollisionalBoundFreeDownwardTransition)
                         return;
 
                     auto const atomicStateCollectionIndex = ion[atomicStateCollectionIndex_];
 
                     // get possible transitions' collectionIndices
                     uint32_t const numberTransitions
-                        = numberTransitionsBox.numberOfTransitionsUp(atomicStateCollectionIndex);
+                        = numberTransitionsBox.numberOfTransitionsDown(atomicStateCollectionIndex);
                     uint32_t const startIndexTransitionBlock
-                        = startIndexBox.startIndexBlockTransitionsUp(atomicStateCollectionIndex);
+                        = startIndexBox.startIndexBlockTransitionsDown(atomicStateCollectionIndex);
 
-                    // get random number
-                    float_X const r = rngGeneratorFloat();
-
-                    // compare to cumulative sum of normalized transition rates to find choosen transition
                     constexpr uint32_t numberBins = T_Histogram::numberBins;
 
                     // 1/unit_time
                     auto const stateTotalLossrate = rateCache.rate(
-                        u32(s_enums::ChooseTransitionGroup::collisionalBoundFreeUpward),
+                        u32(s_enums::ChooseTransitionGroup::collisionalBoundFreeDownward),
                         atomicStateCollectionIndex);
 
                     if(stateTotalLossrate == 0._X)
@@ -218,22 +235,63 @@ namespace picongpu::particles::atomicPhysics::kernel
                         return;
                     }
 
-                    // eV
-                    float_X const ionizationPotentialDepression
-                        = ionizationPotentialDepression::template getIPD<T_IPDModel>(
-                            atomicStateDataDataBox,
-                            atomicStateCollectionIndex,
-                            superCellConstantIPDInput);
+                    // select capture bin for the captured electron, weighted by bin electron weight share
+                    float_X const rBin = rngGeneratorFloat();
+                    uint32_t captureBinIndex = 0u;
+                    bool captureBinFound = false;
+                    float_X cumSumBin = 0._X;
+                    for(uint32_t binIndex = 0u; binIndex < numberBins; ++binIndex)
+                    {
+                        // 1/sim.unit.length()^3
+                        float_X const binDensity
+                            = cachedHistogram.density[binIndex] * cachedHistogram.binWidth[binIndex];
+                        if(binDensity <= 0._X)
+                            continue;
 
+                        // last non empty bin is the fallback for numerically incomplete cumulative sums
+                        captureBinIndex = binIndex;
+                        captureBinFound = true;
+
+                        cumSumBin += binDensity / densityElectrons;
+                        // inclusive limit, to make sure that rBin==1 is assigned a bin
+                        if(rBin <= cumSumBin)
+                            break;
+                    }
+
+                    /* no electrons in the histogram, but stateTotalLossrate > 0 should not be possible since the
+                     *  three-body recombination rate is proportional to the electron density, reject to be safe */
+                    if(!captureBinFound)
+                    {
+                        setNoChangeTransition(ion);
+                        return;
+                    }
+
+                    // get random number
+                    float_X const r = rngGeneratorFloat();
+
+                    // compare to cumulative sum of normalized transition rates to find chosen transition
                     float_X cumSum = 0._X;
+                    /* last transition with non-zero rate, fallback for numerically incomplete cumulative sums;
+                     *  zero-rate transitions must never be selected */
+                    uint32_t lastTransitionIndexWithRate = 0u;
+                    bool foundTransitionWithRate = false;
                     for(uint32_t transitionID = 0u; transitionID < numberTransitions; ++transitionID)
                     {
                         uint32_t const transitionIndex = transitionID + startIndexTransitionBlock;
 
+                        // eV, same lower-state threshold convention as the upward ionization of this transition
+                        float_X const ionizationPotentialDepression
+                            = ionizationPotentialDepression::template getBoundFreeLowerStateIPD<T_IPDModel>(
+                                atomicStateDataDataBox,
+                                transitionDataBox,
+                                transitionIndex,
+                                superCellConstantIPDInput);
+
+                        // 1/sim.unit.time()
+                        float_X sumRateCollisionalIonization = 0._X;
                         for(uint32_t binIndex = 0u; binIndex < numberBins; ++binIndex)
                         {
-                            // 1/sim.unit.time()
-                            float_X const rateTransition = picongpu::particles::atomicPhysics::rateCalculation::
+                            sumRateCollisionalIonization += picongpu::particles::atomicPhysics::rateCalculation::
                                 BoundFreeCollisionalTransitionRates<T_n_max>::
                                     template rateCollisionalIonizationTransition<
                                         T_ChargeStateDataDataBox,
@@ -248,31 +306,59 @@ namespace picongpu::particles::atomicPhysics::kernel
                                         chargeStateDataDataBox,
                                         atomicStateDataDataBox,
                                         transitionDataBox);
+                        }
 
-                            cumSum += rateTransition / stateTotalLossrate;
-
-                            // inclusive limit, to make sure that r==1 is assigned a transition
-                            if(r <= cumSum)
-                            {
-                                // found chosen transition
-                                updateIon(
-                                    ion,
-                                    u8(picongpu::particles::atomicPhysics::enums::ProcessClass::electronicIonization),
+                        // 1/sim.unit.time()
+                        float_X const rateTransition = picongpu::particles::atomicPhysics::rateCalculation::
+                            BoundFreeCollisionalTransitionRates<T_n_max>::
+                                template rateCollisionalThreeBodyRecombinationTransition<
+                                    T_ChargeStateDataDataBox,
+                                    T_AtomicStateDataDataBox,
+                                    T_BoundFreeTransitionDataBox>(
+                                    temperatureElectrons,
+                                    densityElectrons,
+                                    sumRateCollisionalIonization,
+                                    ionizationPotentialDepression,
                                     transitionIndex,
-                                    binIndex);
-                                return;
-                            }
+                                    chargeStateDataDataBox,
+                                    atomicStateDataDataBox,
+                                    transitionDataBox);
+
+                        if(rateTransition <= 0._X)
+                            continue;
+
+                        lastTransitionIndexWithRate = transitionIndex;
+                        foundTransitionWithRate = true;
+
+                        cumSum += rateTransition / stateTotalLossrate;
+
+                        // inclusive limit, to make sure that r==1 is assigned a transition
+                        if(r <= cumSum)
+                        {
+                            // found chosen transition
+                            updateIon(
+                                ion,
+                                u8(picongpu::particles::atomicPhysics::enums::ProcessClass::threeBodyRecombination),
+                                transitionIndex,
+                                captureBinIndex);
+                            return;
                         }
                     }
 
-                    /// @todo not calculate the last transitions rate, instead directly skip to last resort, Brian
-                    /// Marre, 2024
-                    // select last resort, choose last possible transition
+                    /* all recomputed rates zero although stateTotalLossrate > 0 should not be possible, reject to
+                     *  be safe */
+                    if(!foundTransitionWithRate)
+                    {
+                        setNoChangeTransition(ion);
+                        return;
+                    }
+
+                    // numerically incomplete cumulative sum, select last transition with non-zero rate
                     updateIon(
                         ion,
-                        u8(picongpu::particles::atomicPhysics::enums::ProcessClass::electronicIonization),
-                        startIndexTransitionBlock + numberTransitions - 1u,
-                        numberBins - 1u);
+                        u8(picongpu::particles::atomicPhysics::enums::ProcessClass::threeBodyRecombination),
+                        lastTransitionIndexWithRate,
+                        captureBinIndex);
                 });
         }
     };

@@ -81,7 +81,8 @@ namespace picongpu::particles::atomicPhysics::stage
 
             constexpr bool atLeastOneElectronicCollisionalChannelActive
                 = AtomicDataType::switchElectronicExcitation || AtomicDataType::switchElectronicDeexcitation
-                  || AtomicDataType::switchElectronicIonization;
+                  || AtomicDataType::switchElectronicIonization || AtomicDataType::switchThreeBodyRecombination
+                  || AtomicDataType::switchRadiativeRecombination;
             constexpr bool fieldIonizationActive = AtomicDataType::switchFieldIonization;
 
             if constexpr(atLeastOneElectronicCollisionalChannelActive || fieldIonizationActive)

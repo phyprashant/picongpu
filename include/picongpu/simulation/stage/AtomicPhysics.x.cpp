@@ -29,6 +29,7 @@
 #include "picongpu/particles/atomicPhysics/debug/stage/DumpRateCacheToConsole.hpp"
 #include "picongpu/particles/atomicPhysics/debug/stage/DumpSuperCellDataToConsole.hpp"
 #include "picongpu/particles/atomicPhysics/param.hpp"
+#include "picongpu/particles/atomicPhysics/stage/ApplyElectronCapture.hpp"
 #include "picongpu/particles/atomicPhysics/stage/BinElectrons.hpp"
 #include "picongpu/particles/atomicPhysics/stage/CalculateStepLength.hpp"
 #include "picongpu/particles/atomicPhysics/stage/CheckForFieldEnergyOverSubscription.hpp"
@@ -38,6 +39,7 @@
 #include "picongpu/particles/atomicPhysics/stage/ChooseTransition.hpp"
 #include "picongpu/particles/atomicPhysics/stage/ChooseTransitionGroup.hpp"
 #include "picongpu/particles/atomicPhysics/stage/DecelerateElectrons.hpp"
+#include "picongpu/particles/atomicPhysics/stage/FillAnalyticMaxwellianElectronHistogram.hpp"
 #include "picongpu/particles/atomicPhysics/stage/FillRateCache.hpp"
 #include "picongpu/particles/atomicPhysics/stage/FixAtomicState.hpp"
 #include "picongpu/particles/atomicPhysics/stage/LoadAtomicInputData.hpp"
@@ -263,6 +265,17 @@ namespace picongpu::simulation::stage
                     mappingDesc);
             };
 
+            //! reset the captured weight cache on device side
+            HINLINE static void resetCapturedWeightCache()
+            {
+                pmacc::DataConnector& dc = pmacc::Environment<>::get().DataConnector();
+                auto& capturedWeightCacheField
+                    = *dc.get<localHelperFields::CapturedWeightCacheField<picongpu::MappingDesc>>(
+                        "CapturedWeightCacheField");
+                capturedWeightCacheField.getDeviceBuffer().setValue(
+                    typename localHelperFields::CapturedWeightCacheField<picongpu::MappingDesc>::ElementType());
+            }
+
             HINLINE static void resetAcceptedStatus(picongpu::MappingDesc const& mappingDesc)
             {
                 // particle[accepted_] = false, in each macro ion
@@ -310,10 +323,17 @@ namespace picongpu::simulation::stage
 
             HINLINE static void binElectronsToEnergyHistogram(picongpu::MappingDesc const& mappingDesc)
             {
-                using ForEachElectronSpeciesBinElectrons = pmacc::meta::ForEach<
-                    AtomicPhysicsElectronSpecies,
-                    particles::atomicPhysics::stage::BinElectrons<boost::mpl::_1>>;
-                ForEachElectronSpeciesBinElectrons{}(mappingDesc);
+                if constexpr(debug::scFlyComparison::USE_ANALYTIC_MAXWELLIAN_ELECTRON_HISTOGRAM)
+                {
+                    particles::atomicPhysics::stage::FillAnalyticMaxwellianElectronHistogram{}(mappingDesc);
+                }
+                else
+                {
+                    using ForEachElectronSpeciesBinElectrons = pmacc::meta::ForEach<
+                        AtomicPhysicsElectronSpecies,
+                        particles::atomicPhysics::stage::BinElectrons<boost::mpl::_1>>;
+                    ForEachElectronSpeciesBinElectrons{}(mappingDesc);
+                }
 
                 printHistogramToConsole<BinSelection::All, enums::Loop::SubStep>(mappingDesc, "[after binning]");
             }
@@ -533,8 +553,18 @@ namespace picongpu::simulation::stage
             //! @attention assumes that all macro ions' choose a transition have been updated
             HINLINE static void updateElectrons(picongpu::MappingDesc const& mappingDesc, uint32_t const currentStep)
             {
+                /** @note ApplyElectronCapture must be called before DecelerateElectrons: electron energies are then
+                 * still unchanged since the histogram binning, so the capture bin lookup matches the bin the
+                 * captured weight was selected and reserved from. Capture rescales weighting and momentum together,
+                 * leaving per electron energies, and thereby the bin lookup of DecelerateElectrons, unchanged. */
+                using ForEachElectronSpeciesApplyElectronCapture = pmacc::meta::ForEach<
+                    AtomicPhysicsElectronSpecies,
+                    particles::atomicPhysics::stage::ApplyElectronCapture<boost::mpl::_1>>;
+                ForEachElectronSpeciesApplyElectronCapture{}(mappingDesc);
+
                 /** @note DecelerateElectrons must be called before SpawnIonizationElectrons such that we only
-                 * change electrons that actually contributed to the histogram*/
+                 * change electrons that actually contributed to the histogram. It distributes each bin's energy
+                 * change over the surviving, non-captured, electron weight of the bin. */
                 using ForEachElectronSpeciesDecelerateElectrons = pmacc::meta::ForEach<
                     AtomicPhysicsElectronSpecies,
                     particles::atomicPhysics::stage::DecelerateElectrons<boost::mpl::_1>>;
@@ -695,10 +725,16 @@ namespace picongpu::simulation::stage
                     ForEach<AtomicPhysicsIonSpecies, particles::atomicPhysics::stage::FixAtomicState<boost::mpl::_1>>;
                 ForEachIonSpeciesFixAtomicState{}(mappingDesc);
 
+                // temporary instrumentation: count loop iterations per PIC step, printed below
+                uint64_t numSubSteps = 0u;
+                uint64_t numChooseTransitionIterations = 0u;
+                uint64_t numRejectionIterations = 0u;
+
                 // atomicPhysics sub-stepping loop
                 bool isSubSteppingComplete = false;
                 while(!isSubSteppingComplete)
                 {
+                    ++numSubSteps;
                     debugForceConstantElectronTemperature(currentStep);
                     applyIPDIonization</*skip finished super cells*/ true>(
                         mappingDesc,
@@ -720,6 +756,7 @@ namespace picongpu::simulation::stage
                     bool isHistogramOverSubscribed = true;
                     while(isHistogramOverSubscribed)
                     {
+                        ++numChooseTransitionIterations;
                         chooseTransition(mappingDesc, currentStep);
                         recordSuggestedChanges(mappingDesc);
 
@@ -731,6 +768,7 @@ namespace picongpu::simulation::stage
 
                         while(isOverSubscribed)
                         {
+                            ++numRejectionIterations;
                             // at least one superCell electron histogram over-subscribed
                             randomlyRejectTransitionFromOverSubscribedResources(mappingDesc, currentStep);
                             recordSuggestedChanges(mappingDesc);
@@ -749,12 +787,18 @@ namespace picongpu::simulation::stage
                     printTimeStepToConsole(mappingDesc);
                     printFieldEnergyUseCacheToConsole<enums::Loop::SubStep>(mappingDesc);
 
+                    resetCapturedWeightCache();
                     recordChanges(mappingDesc);
                     updateElectrons(mappingDesc, currentStep);
                     updateElectricField(mappingDesc);
                     updateTimeRemaining(mappingDesc);
                     isSubSteppingComplete = isSubSteppingFinished(mappingDesc, deviceLocalReduce);
                 } // end atomicPhysics sub-stepping loop
+
+                // temporary instrumentation output, one line per PIC step
+                std::cout << "[atomicPhysics instrumentation] step " << currentStep << ": subSteps=" << numSubSteps
+                          << ", chooseTransitionIterations=" << numChooseTransitionIterations
+                          << ", rejectionIterations=" << numRejectionIterations << std::endl;
 
                 // ensure no unbound states are visible to the rest of the loop
                 applyIPDIonization</*skip finished super cells*/ false>(mappingDesc, currentStep, deviceLocalReduce);
@@ -806,6 +850,14 @@ namespace picongpu::simulation::stage
             log<picLog::PHYSICS>("[atomicPhysics WARNING]: (using DEBUG ONLY feature), forcing a constant electron "
                                  "temperature of %1% keV, per user direction.")
                 % picongpu::atomicPhysics::debug::scFlyComparison::TemperatureParam::temperature;
+        }
+        if constexpr(picongpu::atomicPhysics::debug::scFlyComparison::USE_ANALYTIC_MAXWELLIAN_ELECTRON_HISTOGRAM)
+        {
+            log<picLog::PHYSICS>(
+                "[atomicPhysics WARNING]: (using DEBUG ONLY feature), filling the electron histogram from an "
+                "analytic Maxwellian at %1% keV and electron density %2% m^-3.")
+                % picongpu::atomicPhysics::debug::scFlyComparison::TemperatureParam::temperature
+                % picongpu::atomicPhysics::debug::scFlyComparison::AnalyticMaxwellianParam::electronDensitySI;
         }
 
         if constexpr(picongpu::atomicPhysics::debug::fixedRateMatrix::USE_FIXED_RATE_INSTEAD_OF_RATE_CALCULATION)

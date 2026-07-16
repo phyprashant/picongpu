@@ -71,7 +71,11 @@ namespace picongpu::atomicPhysics::debug
     namespace rateCache
     {
         //! @attention only useful if using serial backend, no output unless compiling for cpu backend
+#ifdef PARAM_ATOMIC_RATE_CACHE_PRINT_TO_CONSOLE
+        constexpr bool PRINT_TO_CONSOLE = PARAM_ATOMIC_RATE_CACHE_PRINT_TO_CONSOLE;
+#else
         constexpr bool PRINT_TO_CONSOLE = false;
+#endif
 
         //! @attention performance relevant
         constexpr bool COLLECTION_INDEX_RANGE_CHECKS = false;
@@ -121,13 +125,38 @@ namespace picongpu::atomicPhysics::debug
          *
          * @attention this creates unphysical currents, **do not use outside debug!**
          */
+#ifdef PARAM_FORCE_CONSTANT_ELECTRON_TEMPERATURE
+        constexpr bool FORCE_CONSTANT_ELECTRON_TEMPERATURE = PARAM_FORCE_CONSTANT_ELECTRON_TEMPERATURE;
+#else
         constexpr bool FORCE_CONSTANT_ELECTRON_TEMPERATURE = false;
+#endif
+
+#ifdef PARAM_ATOMIC_RATE_CACHE_USE_ANALYTIC_MAXWELLIAN
+        constexpr bool USE_ANALYTIC_MAXWELLIAN_ELECTRON_HISTOGRAM
+            = PARAM_ATOMIC_RATE_CACHE_USE_ANALYTIC_MAXWELLIAN;
+#else
+        constexpr bool USE_ANALYTIC_MAXWELLIAN_ELECTRON_HISTOGRAM = false;
+#endif
+
+#ifndef PARAM_FORCE_CONSTANT_ELECTRON_TEMPERATURE_KEV
+#    define PARAM_FORCE_CONSTANT_ELECTRON_TEMPERATURE_KEV 1.
+#endif
+
+#ifndef PARAM_ATOMIC_RATE_CACHE_ANALYTIC_ELECTRON_DENSITY_SI
+#    define PARAM_ATOMIC_RATE_CACHE_ANALYTIC_ELECTRON_DENSITY_SI 1.e28
+#endif
 
         //! fixed temperature setting
         struct TemperatureParam
         {
             //! Initial temperature, [keV]
-            static constexpr float_64 temperature = 1.;
+            static constexpr float_64 temperature = PARAM_FORCE_CONSTANT_ELECTRON_TEMPERATURE_KEV;
+        };
+
+        //! fixed electron density used by the analytic Maxwellian histogram, [m^-3]
+        struct AnalyticMaxwellianParam
+        {
+            static constexpr float_64 electronDensitySI = PARAM_ATOMIC_RATE_CACHE_ANALYTIC_ELECTRON_DENSITY_SI;
         };
     } // namespace scFlyComparison
 

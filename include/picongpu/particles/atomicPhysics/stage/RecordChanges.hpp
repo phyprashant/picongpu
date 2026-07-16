@@ -25,6 +25,7 @@
 #include "picongpu/particles/atomicPhysics/electronDistribution/LocalHistogramField.hpp"
 #include "picongpu/particles/atomicPhysics/enums/ProcessClass.hpp"
 #include "picongpu/particles/atomicPhysics/kernel/RecordChanges.kernel"
+#include "picongpu/particles/atomicPhysics/localHelperFields/CapturedWeightCacheField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/TimeRemainingField.hpp"
 #include "picongpu/particles/param.hpp"
 
@@ -163,6 +164,50 @@ namespace picongpu::particles::atomicPhysics::stage
                     atomicData
                         .template getBoundFreeTransitionDataBox<false, s_enums::TransitionOrdering::byLowerState>(),
                     atomicData.template getChargeStateDataDataBox<false>());
+            }
+
+            if constexpr(AtomicDataType::switchThreeBodyRecombination)
+            {
+                using RecordChanges_threeBodyRecombination = picongpu::particles::atomicPhysics::kernel::
+                    RecordChangesKernel<s_enums::ProcessClass::threeBodyRecombination, IPDModel>;
+
+                auto& capturedWeightCacheField
+                    = *dc.get<picongpu::particles::atomicPhysics::localHelperFields::CapturedWeightCacheField<
+                        picongpu::MappingDesc>>("CapturedWeightCacheField");
+
+                IPDModel::template callKernelWithIPDInput<
+                    RecordChanges_threeBodyRecombination,
+                    IonSpecies::FrameType::frameSize>(
+                    dc,
+                    mapper,
+                    timeRemainingField.getDeviceDataBox(),
+                    ions.getDeviceParticlesBox(),
+                    electronHistogramField.getDeviceDataBox(),
+                    atomicData.template getAtomicStateDataDataBox<false>(),
+                    atomicData
+                        .template getBoundFreeTransitionDataBox<false, s_enums::TransitionOrdering::byUpperState>(),
+                    capturedWeightCacheField.getDeviceDataBox(),
+                    atomicData.template getChargeStateDataDataBox<false>());
+            }
+
+            if constexpr(AtomicDataType::switchRadiativeRecombination)
+            {
+                using RecordChanges_radiativeRecombination = picongpu::particles::atomicPhysics::kernel::
+                    RecordChangesKernel<s_enums::ProcessClass::radiativeRecombination, IPDModel>;
+
+                auto& capturedWeightCacheField
+                    = *dc.get<picongpu::particles::atomicPhysics::localHelperFields::CapturedWeightCacheField<
+                        picongpu::MappingDesc>>("CapturedWeightCacheField");
+
+                PMACC_LOCKSTEP_KERNEL(RecordChanges_radiativeRecombination())
+                    .config(mapper.getGridDim(), ions)(
+                        mapper,
+                        timeRemainingField.getDeviceDataBox(),
+                        ions.getDeviceParticlesBox(),
+                        atomicData.template getAtomicStateDataDataBox<false>(),
+                        atomicData
+                            .template getBoundFreeTransitionDataBox<false, s_enums::TransitionOrdering::byUpperState>(),
+                        capturedWeightCacheField.getDeviceDataBox());
             }
 
             if constexpr(AtomicDataType::switchAutonomousIonization)

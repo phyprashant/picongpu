@@ -29,7 +29,9 @@
 #include "picongpu/particles/atomicPhysics/kernel/ChooseTransition_Autonomous.kernel"
 #include "picongpu/particles/atomicPhysics/kernel/ChooseTransition_BoundBound.kernel"
 #include "picongpu/particles/atomicPhysics/kernel/ChooseTransition_CollisionalBoundFree.kernel"
+#include "picongpu/particles/atomicPhysics/kernel/ChooseTransition_CollisionalBoundFreeDownward.kernel"
 #include "picongpu/particles/atomicPhysics/kernel/ChooseTransition_FieldBoundFree.kernel"
+#include "picongpu/particles/atomicPhysics/kernel/ChooseTransition_RadiativeBoundFreeDownward.kernel"
 #include "picongpu/particles/atomicPhysics/localHelperFields/RateCacheField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/TimeRemainingField.hpp"
 #include "picongpu/particles/param.hpp"
@@ -162,6 +164,60 @@ namespace picongpu::particles::atomicPhysics::stage
                     atomicData.template getBoundFreeStartIndexBlockDataBox<false>(),
                     atomicData
                         .template getBoundFreeTransitionDataBox<false, s_enums::TransitionOrdering::byLowerState>(),
+                    timeRemainingField.getDeviceDataBox(),
+                    electronHistogramField.getDeviceDataBox(),
+                    rateCacheField.getDeviceDataBox(),
+                    ions.getDeviceParticlesBox());
+            }
+
+            // bound-free(downward) collisional transitions, i.e. three-body recombination
+            if constexpr(AtomicDataType::switchThreeBodyRecombination)
+            {
+                using ChooseTransitionKernel_CollisionalBoundFreeDownward = picongpu::particles::atomicPhysics::
+                    kernel::ChooseTransitionKernel_CollisionalBoundFreeDownward<
+                        picongpu::atomicPhysics::ElectronHistogram,
+                        AtomicDataType::ConfigNumber::numberLevels,
+                        IPDModel>;
+
+                IPDModel::template callKernelWithIPDInput<
+                    ChooseTransitionKernel_CollisionalBoundFreeDownward,
+                    IonSpecies::FrameType::frameSize>(
+                    dc,
+                    mapper,
+                    rngFactoryFloat,
+                    atomicData.template getChargeStateDataDataBox<false>(),
+                    atomicData.template getAtomicStateDataDataBox<false>(),
+                    atomicData.template getBoundFreeNumberTransitionsDataBox<false>(),
+                    atomicData.template getBoundFreeStartIndexBlockDataBox<false>(),
+                    atomicData
+                        .template getBoundFreeTransitionDataBox<false, s_enums::TransitionOrdering::byUpperState>(),
+                    timeRemainingField.getDeviceDataBox(),
+                    electronHistogramField.getDeviceDataBox(),
+                    rateCacheField.getDeviceDataBox(),
+                    ions.getDeviceParticlesBox());
+            }
+
+            // bound-free(downward) radiative transitions, i.e. spontaneous radiative recombination
+            if constexpr(AtomicDataType::switchRadiativeRecombination)
+            {
+                using ChooseTransitionKernel_RadiativeBoundFreeDownward = picongpu::particles::atomicPhysics::
+                    kernel::ChooseTransitionKernel_RadiativeBoundFreeDownward<
+                        picongpu::atomicPhysics::ElectronHistogram,
+                        AtomicDataType::ConfigNumber::numberLevels,
+                        IPDModel>;
+
+                IPDModel::template callKernelWithIPDInput<
+                    ChooseTransitionKernel_RadiativeBoundFreeDownward,
+                    IonSpecies::FrameType::frameSize>(
+                    dc,
+                    mapper,
+                    rngFactoryFloat,
+                    atomicData.template getChargeStateDataDataBox<false>(),
+                    atomicData.template getAtomicStateDataDataBox<false>(),
+                    atomicData.template getBoundFreeNumberTransitionsDataBox<false>(),
+                    atomicData.template getBoundFreeStartIndexBlockDataBox<false>(),
+                    atomicData
+                        .template getBoundFreeTransitionDataBox<false, s_enums::TransitionOrdering::byUpperState>(),
                     timeRemainingField.getDeviceDataBox(),
                     electronHistogramField.getDeviceDataBox(),
                     rateCacheField.getDeviceDataBox(),

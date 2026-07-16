@@ -197,8 +197,14 @@ namespace picongpu::particles::atomicPhysics::kernel
                         auto ion = ionFrame[idx];
 
                         bool const slotOccupied = static_cast<bool>(ion[multiMask_]);
+                        /* three-body recombination is boundFreeBased but captures an electron instead of spawning
+                         *  one, therefore bound-free processes are filtered by spawnsFreeElectron instead */
+                        constexpr auto spawnFilterGroup
+                            = (u8(T_ProcessClassGroup) == u8(s_enums::ProcessClassGroup::boundFreeBased))
+                            ? s_enums::ProcessClassGroup::spawnsFreeElectron
+                            : T_ProcessClassGroup;
                         bool const ionProcessClassInProcessClassGroup
-                            = s_enums::IsProcess<T_ProcessClassGroup>::check(ion[processClass_]);
+                            = s_enums::IsProcess<spawnFilterGroup>::check(ion[processClass_]);
                         if(!slotOccupied || !ionProcessClassInProcessClassGroup)
                         {
                             numberIonizationElectrons = u8(0u);

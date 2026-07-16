@@ -181,9 +181,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                         uint32_t const binIndex = linearIdx / T_numberAtomicStates;
                         uint32_t const atomicStateCollectionIndex = linearIdx % T_numberAtomicStates;
 
-                        // check if atomic state present at all
-                        if(!rateCache.present(atomicStateCollectionIndex))
-                            return;
+                        bool const atomicStatePresent = rateCache.present(atomicStateCollectionIndex);
 
                         uint32_t numberTransitions;
                         if constexpr(isUpward)
@@ -202,48 +200,58 @@ namespace picongpu::particles::atomicPhysics::kernel
                         auto const energy = cachedHistogram.energy[binIndex];
                         auto const binWidth = cachedHistogram.binWidth[binIndex];
                         auto const density = cachedHistogram.density[binIndex];
+                        auto const densitySlopeToNextBin = cachedHistogram.densitySlopeToNextBin(binIndex);
 
                         for(uint32_t transitionID = u32(0u); transitionID < numberTransitions; ++transitionID)
                         {
+                            uint32_t const transitionCollectionIndex = offset + transitionID;
+                            float_X const transitionRate
+                                = picongpu::particles::atomicPhysics::rateCalculation::BoundBoundTransitionRates<
+                                    T_numberLevels>::
+                                    template rateCollisionalBoundBoundTransition<
+                                        T_AtomicStateDataDataBox,
+                                        T_BoundBoundTransitionDataBox,
+                                        isUpward>(
+                                        energy,
+                                        binWidth,
+                                        density,
+                                        densitySlopeToNextBin,
+                                        transitionCollectionIndex,
+                                        atomicStateDataDataBox,
+                                        boundBoundTransitionDataBox);
+                            uint32_t const lowerStateCollectionIndex
+                                = boundBoundTransitionDataBox.lowerStateCollectionIndex(transitionCollectionIndex);
+                            uint32_t const upperStateCollectionIndex
+                                = boundBoundTransitionDataBox.upperStateCollectionIndex(transitionCollectionIndex);
+                            uint32_t const sourceCollectionIndex
+                                = isUpward ? lowerStateCollectionIndex : upperStateCollectionIndex;
+                            uint32_t const targetCollectionIndex
+                                = isUpward ? upperStateCollectionIndex : lowerStateCollectionIndex;
+                            rateCache.addBoundBoundPairRate(
+                                worker,
+                                sourceCollectionIndex,
+                                targetCollectionIndex,
+                                transitionRate);
+
                             // electronic excitation
                             if constexpr(isUpward)
                             {
-                                rateCache.template add<T_Worker, s_enums::ChooseTransitionGroup::boundBoundUpward>(
-                                    worker,
-                                    atomicStateCollectionIndex,
-                                    // rate
-                                    picongpu::particles::atomicPhysics::rateCalculation::BoundBoundTransitionRates<
-                                        T_numberLevels>::
-                                        template rateCollisionalBoundBoundTransition<
-                                            T_AtomicStateDataDataBox,
-                                            T_BoundBoundTransitionDataBox,
-                                            isUpward>(
-                                            energy,
-                                            binWidth,
-                                            density,
-                                            offset + transitionID,
-                                            atomicStateDataDataBox,
-                                            boundBoundTransitionDataBox));
+                                if(atomicStatePresent)
+                                    rateCache.template add<T_Worker, s_enums::ChooseTransitionGroup::boundBoundUpward>(
+                                        worker,
+                                        atomicStateCollectionIndex,
+                                        // rate
+                                        transitionRate);
                             }
                             // electronic deexcitation
                             else
                             {
-                                rateCache.template add<T_Worker, s_enums::ChooseTransitionGroup::boundBoundDownward>(
-                                    worker,
-                                    atomicStateCollectionIndex,
-                                    // rate
-                                    picongpu::particles::atomicPhysics::rateCalculation::BoundBoundTransitionRates<
-                                        T_numberLevels>::
-                                        template rateCollisionalBoundBoundTransition<
-                                            T_AtomicStateDataDataBox,
-                                            T_BoundBoundTransitionDataBox,
-                                            isUpward>(
-                                            energy,
-                                            binWidth,
-                                            density,
-                                            offset + transitionID,
-                                            atomicStateDataDataBox,
-                                            boundBoundTransitionDataBox));
+                                if(atomicStatePresent)
+                                    rateCache.template add<T_Worker, s_enums::ChooseTransitionGroup::boundBoundDownward>(
+                                        worker,
+                                        atomicStateCollectionIndex,
+                                        // rate
+                                        transitionRate);
                             }
                         }
                     });
@@ -273,18 +281,21 @@ namespace picongpu::particles::atomicPhysics::kernel
 
                         for(uint32_t transitionID = u32(0u); transitionID < numberTransitions; ++transitionID)
                         {
-                            rateCache.template add<s_enums::ChooseTransitionGroup::boundBoundDownward>(
-                                atomicStateCollectionIndex,
-                                // rate
-                                picongpu::particles::atomicPhysics::rateCalculation::BoundBoundTransitionRates<
+                            uint32_t const transitionCollectionIndex = offset + transitionID;
+                            float_X const transitionRate
+                                = picongpu::particles::atomicPhysics::rateCalculation::BoundBoundTransitionRates<
                                     T_numberLevels>::
                                     template rateSpontaneousRadiativeDeexcitation<
                                         T_AtomicStateDataDataBox,
                                         T_BoundBoundTransitionDataBox>(
                                         // transitionCollectionIndex
-                                        offset + transitionID,
+                                        transitionCollectionIndex,
                                         atomicStateDataDataBox,
-                                        boundBoundTransitionDataBox));
+                                        boundBoundTransitionDataBox);
+                            rateCache.template add<s_enums::ChooseTransitionGroup::boundBoundDownward>(
+                                atomicStateCollectionIndex,
+                                // rate
+                                transitionRate);
                         }
                     });
             }

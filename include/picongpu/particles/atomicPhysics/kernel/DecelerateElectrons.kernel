@@ -36,6 +36,8 @@ namespace picongpu::particles::atomicPhysics::kernel
     /** decelerate electron kernel
      *
      * @attention assumes that the histogram deltaEnergy values have been filled previously
+     * @attention assumes that the ApplyElectronCapture sub-stage has been executed previously, each bin's energy
+     *  change is distributed over the surviving, non-captured, electron weight of the bin only
      *
      * called by decelerateElectrons sub-stage, changes the momentum all macro particles
      *  of the species T_ElectronSpecies in the given superCell to on average match the
@@ -57,19 +59,23 @@ namespace picongpu::particles::atomicPhysics::kernel
          *   of all local superCells
          * @param electronHistogramDataBox deviceDataBox giving access to the
          *  local electron histograms of all local superCells
+         * @param capturedWeightCacheBox deviceDataBox giving access to the captured weight cache of all local
+         *  superCells
          */
         template<
             typename T_Worker,
             typename T_AreaMapping,
             typename T_LocalTimeRemainingBox,
             typename T_ElectronBox,
-            typename T_LocalElectronHistogramDataBox>
+            typename T_LocalElectronHistogramDataBox,
+            typename T_LocalCapturedWeightCacheBox>
         HDINLINE void operator()(
             T_Worker const& worker,
             T_AreaMapping const areaMapping,
             T_LocalTimeRemainingBox const timeRemainingBox,
             T_ElectronBox electronBox,
-            T_LocalElectronHistogramDataBox electronHistogramDataBox) const
+            T_LocalElectronHistogramDataBox electronHistogramDataBox,
+            T_LocalCapturedWeightCacheBox capturedWeightCacheBox) const
         {
             pmacc::DataSpace<simDim> const superCellIdx = areaMapping.getSuperCellIndex(worker.blockDomIdxND());
 
@@ -87,12 +93,13 @@ namespace picongpu::particles::atomicPhysics::kernel
             if((timeRemaining <= 0._X) || (!forEachLocalElectronBoxEntry.hasParticles()))
                 return;
 
-            // get histogram for current superCell
+            // get histogram and captured weight cache for current superCell
             T_Histogram& histogram = electronHistogramDataBox(superCellFieldIdx);
+            auto& capturedWeightCache = capturedWeightCacheBox(superCellFieldIdx);
 
             // decelerate electrons
             forEachLocalElectronBoxEntry(
-                [&histogram](T_Worker const& worker, auto& electron)
+                [&histogram, &capturedWeightCache](T_Worker const& worker, auto& electron)
                 {
                     // energy of a single corresponding physical electron,
                     //      no need to use float_64 since really high energy electrons are
@@ -111,6 +118,15 @@ namespace picongpu::particles::atomicPhysics::kernel
                     float_X const deltaEnergyBin = histogram.getBinDeltaEnergy(binIndex);
                     // eV, weighted
 
+                    /* captured weight was removed from the bin by recombination processes in the
+                     *  ApplyElectronCapture sub-stage, the bin's energy change is carried by the surviving,
+                     *  spectator, electron weight only */
+                    float_X const survivingWeightBin = weightBin - capturedWeightCache.getCapturedWeight(binIndex);
+
+                    // no spectator weight to receive the bin's energy change
+                    if(survivingWeightBin <= 0._X)
+                        return;
+
                     // m_internal * kg/m_internal * m^2/s^2 * eV/J = kg * m^2/s^2 * eV/ J
                     //  = Nm/J * eV = J/J * eV = eV, ~ 511e3 eV
                     float_X const mcSquaredElectron = static_cast<float_X>(
@@ -119,9 +135,10 @@ namespace picongpu::particles::atomicPhysics::kernel
                             sim.unit.mass() * pmacc::math::cPow(picongpu::sim.si.getSpeedOfLight(), 2u)));
                     // eV, not weighted
 
-                    // distribute energy change as mean by weight on all electrons in bin
+                    // distribute energy change as mean by weight on all surviving electrons in bin
                     // eV + eV /(unitless * unitless) = eV
-                    float_X newEnergyElectron = energyElectron + static_cast<float_X>(deltaEnergyBin / weightBin);
+                    float_X newEnergyElectron
+                        = energyElectron + static_cast<float_X>(deltaEnergyBin / survivingWeightBin);
                     // (eV, not weighted) + ((eV, weighted)/weight)
                     //  = (eV, not weighted) + (eV, not weighted) = (eV, weighted)
                     // eV, not weighted

@@ -1,0 +1,84 @@
+/* Copyright 2026 PIConGPU contributors
+ *
+ * This file is part of PIConGPU.
+ *
+ * PIConGPU is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * PIConGPU is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with PIConGPU.
+ * If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include "picongpu/defines.hpp"
+#include "picongpu/particles/atomicPhysics/KernelIndexation.hpp"
+#include "picongpu/particles/atomicPhysics/debug/param.hpp"
+
+#include <pmacc/algorithms/math/PowerFunction.hpp>
+#include <pmacc/lockstep/ForEach.hpp>
+
+#include <cstdint>
+
+namespace picongpu::particles::atomicPhysics::kernel
+{
+    /** Fill each supercell electron histogram with the same analytic Maxwellian EEDF. */
+    template<typename T_Histogram>
+    struct FillAnalyticMaxwellianElectronHistogramKernel
+    {
+        template<typename T_Worker, typename T_AreaMapping, typename T_TimeRemainingBox, typename T_HistogramDataBox>
+        HDINLINE void operator()(
+            T_Worker const& worker,
+            T_AreaMapping const areaMapping,
+            T_TimeRemainingBox const timeRemainingBox,
+            T_HistogramDataBox histogramBox) const
+        {
+            auto const superCellFieldIdx = KernelIndexation::getSuperCellFieldIndex(worker, areaMapping);
+
+            auto const timeRemaining = timeRemainingBox(superCellFieldIdx);
+            if(timeRemaining <= 0._X)
+                return;
+
+            constexpr float_X temperatureEV = static_cast<float_X>(
+                picongpu::atomicPhysics::debug::scFlyComparison::TemperatureParam::temperature * 1.0e3);
+            constexpr float_X electronDensitySI = static_cast<float_X>(
+                picongpu::atomicPhysics::debug::scFlyComparison::AnalyticMaxwellianParam::electronDensitySI);
+            constexpr float_X electronDensityInternal
+                = electronDensitySI * pmacc::math::cPow(picongpu::sim.unit.length(), 3u);
+            constexpr float_X volumeScalingFactor
+                = pmacc::math::CT::volume<picongpu::SuperCellSize>::type::value
+                  * picongpu::sim.pic.getCellSize().productOfComponents();
+
+            auto forEachBin = pmacc::lockstep::makeForEach<T_Histogram::numberBins, T_Worker>(worker);
+            T_Histogram& histogram = histogramBox(superCellFieldIdx);
+
+            forEachBin(
+                [&worker, &histogram, electronDensityInternal, temperatureEV, volumeScalingFactor](
+                    uint32_t const binIndex)
+                {
+                    float_X const energy = histogram.getBinEnergy(binIndex);
+                    float_X const binWidth = histogram.getBinWidth(binIndex);
+
+                    // Non-relativistic Maxwell-Boltzmann energy probability density, normalized over [0, infinity).
+                    constexpr float_X twoOverSqrtPi = static_cast<float_X>(1.1283791670955125739);
+                    float_X const maxwellianPerEV
+                        = twoOverSqrtPi * math::sqrt(energy)
+                          / (temperatureEV * math::sqrt(temperatureEV))
+                          * math::exp(-energy / temperatureEV);
+
+                    float_X const binWeight
+                        = electronDensityInternal * maxwellianPerEV * binWidth * volumeScalingFactor;
+
+                    histogram.binParticle(worker, energy, binWeight);
+                });
+        }
+    };
+} // namespace picongpu::particles::atomicPhysics::kernel

@@ -35,6 +35,8 @@
 #include "picongpu/particles/atomicPhysics/kernel/FillRateCache_Autonomous.kernel"
 #include "picongpu/particles/atomicPhysics/kernel/FillRateCache_BoundBound.kernel"
 #include "picongpu/particles/atomicPhysics/kernel/FillRateCache_BoundFree.kernel"
+#include "picongpu/particles/atomicPhysics/kernel/FillRateCache_BoundFreeCollisionalDownward.kernel"
+#include "picongpu/particles/atomicPhysics/kernel/FillRateCache_BoundFreeRadiativeDownward.kernel"
 #include "picongpu/particles/atomicPhysics/localHelperFields/RateCacheField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/TimeRemainingField.hpp"
 #include "picongpu/particles/param.hpp"
@@ -180,6 +182,60 @@ namespace picongpu::particles::atomicPhysics::stage
                     atomicData->template getBoundFreeNumberTransitionsDataBox<false>(),
                     atomicData
                         ->template getBoundFreeTransitionDataBox<false, enums::TransitionOrdering::byLowerState>());
+            }
+
+            //    downward bound-free transition rates, i.e. three-body recombination
+            if constexpr(AtomicDataType::switchThreeBodyRecombination)
+            {
+                using FillRateCacheDownWardBoundFree = kernel::FillRateCacheKernel_BoundFreeCollisionalDownward<
+                    IPDModel,
+                    n_max,
+                    numberAtomicStatesOfSpecies,
+                    numberBins,
+                    AtomicDataType::switchThreeBodyRecombination,
+                    enums::TransitionOrdering::byUpperState>;
+
+                IPDModel::template callKernelWithIPDInput<
+                    FillRateCacheDownWardBoundFree,
+                    IonSpecies::FrameType::frameSize>(
+                    dc,
+                    mapper,
+                    timeRemainingField->getDeviceDataBox(),
+                    rateCacheField->getDeviceDataBox(),
+                    electronHistogramField->getDeviceDataBox(),
+                    atomicData->template getChargeStateDataDataBox<false>(),
+                    atomicData->template getAtomicStateDataDataBox<false>(),
+                    atomicData->template getBoundFreeStartIndexBlockDataBox<false>(),
+                    atomicData->template getBoundFreeNumberTransitionsDataBox<false>(),
+                    atomicData
+                        ->template getBoundFreeTransitionDataBox<false, enums::TransitionOrdering::byUpperState>());
+            }
+
+            //    downward radiative bound-free transition rates, i.e. spontaneous radiative recombination
+            if constexpr(AtomicDataType::switchRadiativeRecombination)
+            {
+                using FillRateCacheRadiativeDownWardBoundFree = kernel::FillRateCacheKernel_BoundFreeRadiativeDownward<
+                    IPDModel,
+                    n_max,
+                    numberAtomicStatesOfSpecies,
+                    numberBins,
+                    AtomicDataType::switchRadiativeRecombination,
+                    enums::TransitionOrdering::byUpperState>;
+
+                IPDModel::template callKernelWithIPDInput<
+                    FillRateCacheRadiativeDownWardBoundFree,
+                    IonSpecies::FrameType::frameSize>(
+                    dc,
+                    mapper,
+                    timeRemainingField->getDeviceDataBox(),
+                    rateCacheField->getDeviceDataBox(),
+                    electronHistogramField->getDeviceDataBox(),
+                    atomicData->template getChargeStateDataDataBox<false>(),
+                    atomicData->template getAtomicStateDataDataBox<false>(),
+                    atomicData->template getBoundFreeStartIndexBlockDataBox<false>(),
+                    atomicData->template getBoundFreeNumberTransitionsDataBox<false>(),
+                    atomicData
+                        ->template getBoundFreeTransitionDataBox<false, enums::TransitionOrdering::byUpperState>());
             }
 
             //    downward autonomous transition rates

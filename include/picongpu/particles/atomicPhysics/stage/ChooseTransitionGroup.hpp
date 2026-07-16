@@ -85,9 +85,11 @@ namespace picongpu::particles::atomicPhysics::stage
                     AtomicDataType::switchElectronicExcitation,
                     AtomicDataType::switchElectronicDeexcitation,
                     AtomicDataType::switchSpontaneousDeexcitation,
-                    AtomicDataType::switchAutonomousIonization,
                     AtomicDataType::switchElectronicIonization,
-                    AtomicDataType::switchFieldIonization>;
+                    AtomicDataType::switchAutonomousIonization,
+                    AtomicDataType::switchFieldIonization,
+                    AtomicDataType::switchThreeBodyRecombination,
+                    AtomicDataType::switchRadiativeRecombination>;
             PMACC_LOCKSTEP_KERNEL(ChooseTransitionGroupKernel())
                 .config(mapper.getGridDim(), ions)(
                     mapper,

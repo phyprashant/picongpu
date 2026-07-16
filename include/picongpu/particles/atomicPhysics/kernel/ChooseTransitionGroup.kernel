@@ -42,9 +42,11 @@ namespace picongpu::particles::atomicPhysics::kernel
      * @tparam T_electronicExcitation is channel active?
      * @tparam T_electronicDeexcitation is channel active?
      * @tparam T_spontaneousDeexcitation is channel active?
-     * @tparam T_autonomousIonization is channel active?
      * @tparam T_electronicIonization is channel active?
+     * @tparam T_autonomousIonization is channel active?
      * @tparam T_fieldIonization is channel active?
+     * @tparam T_threeBodyRecombination is channel active?
+     * @tparam T_radiativeRecombination is channel active?
      */
     template<
         typename T_RateCache,
@@ -53,7 +55,9 @@ namespace picongpu::particles::atomicPhysics::kernel
         bool T_spontaneousDeexcitation,
         bool T_electronicIonization,
         bool T_autonomousIonization,
-        bool T_fieldIonization>
+        bool T_fieldIonization,
+        bool T_threeBodyRecombination,
+        bool T_radiativeRecombination>
     struct ChooseTransitionGroupKernel
     {
     private:
@@ -81,6 +85,12 @@ namespace picongpu::particles::atomicPhysics::kernel
                     return true;
             if constexpr(T_autonomousIonization)
                 if(transitionTypeIndex == u32(s_enums::ChooseTransitionGroup::autonomousDownward))
+                    return true;
+            if constexpr(T_threeBodyRecombination)
+                if(transitionTypeIndex == u32(s_enums::ChooseTransitionGroup::collisionalBoundFreeDownward))
+                    return true;
+            if constexpr(T_radiativeRecombination)
+                if(transitionTypeIndex == u32(s_enums::ChooseTransitionGroup::radiativeBoundFreeDownward))
                     return true;
 
             // unknown or deactivated transitionType

@@ -252,6 +252,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                                         cachedHistogram.energy[binIndex],
                                         cachedHistogram.binWidth[binIndex],
                                         density,
+                                        cachedHistogram.densitySlopeToNextBin(binIndex),
                                         transitionID + startIndexTransitionBlock,
                                         atomicStateDataDataBox,
                                         transitionDataBox);
