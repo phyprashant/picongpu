@@ -40,7 +40,14 @@ namespace picongpu::particles::atomicPhysics
             electronicCollisional = 4u,
             electricFieldBased = 5u,
             upward = 6u,
-            downward = 7u
+            downward = 7u,
+            /** processes creating one or more free (ionization) macro electrons
+             *
+             * @attention distinct from boundFreeBased/ionizing: three-body recombination is bound-free based but
+             *  must never spawn electrons, use this group in electron spawn logic */
+            spawnsFreeElectron = 8u,
+            /** processes capturing/removing a free electron, e.g. three-body recombination */
+            capturesFreeElectron = 9u
         };
     } // namespace enums
 
@@ -63,6 +70,10 @@ namespace picongpu::particles::atomicPhysics
             return "upward";
         if constexpr(u8(T_ProcessClassGroup) == u8(enums::ProcessClassGroup::downward))
             return "downard";
+        if constexpr(u8(T_ProcessClassGroup) == u8(enums::ProcessClassGroup::spawnsFreeElectron))
+            return "spawnsFreeElectron";
+        if constexpr(u8(T_ProcessClassGroup) == u8(enums::ProcessClassGroup::capturesFreeElectron))
+            return "capturesFreeElectron";
         return "unknown";
     }
 } // namespace picongpu::particles::atomicPhysics

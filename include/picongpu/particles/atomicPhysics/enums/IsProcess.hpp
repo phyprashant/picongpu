@@ -58,9 +58,10 @@ namespace picongpu::particles::atomicPhysics::enums
     {
         static constexpr bool check(uint8_t const processClass)
         {
-            ///@todo implement recombination, Brian Marre, 2023
             if((processClass == u8(ProcessClass::electronicIonization))
-               || (processClass == u8(ProcessClass::fieldIonization)))
+               || (processClass == u8(ProcessClass::fieldIonization))
+               || (processClass == u8(ProcessClass::threeBodyRecombination))
+               || (processClass == u8(ProcessClass::radiativeRecombination)))
                 return true;
             return false;
         }
@@ -101,7 +102,9 @@ namespace picongpu::particles::atomicPhysics::enums
         {
             if((processClass == u8(ProcessClass::electronicExcitation))
                || (processClass == u8(ProcessClass::electronicDeexcitation))
-               || (processClass == u8(ProcessClass::electronicIonization)))
+               || (processClass == u8(ProcessClass::electronicIonization))
+               || (processClass == u8(ProcessClass::threeBodyRecombination))
+               || (processClass == u8(ProcessClass::radiativeRecombination)))
                 return true;
             return false;
         }
@@ -141,7 +144,40 @@ namespace picongpu::particles::atomicPhysics::enums
         {
             if((processClass == u8(ProcessClass::electronicDeexcitation))
                || (processClass == u8(ProcessClass::spontaneousDeexcitation))
-               || (processClass == u8(ProcessClass::autonomousIonization)))
+               || (processClass == u8(ProcessClass::autonomousIonization))
+               || (processClass == u8(ProcessClass::threeBodyRecombination))
+               || (processClass == u8(ProcessClass::radiativeRecombination)))
+                return true;
+            return false;
+        }
+    };
+
+    /** processClasses creating one or more free (ionization) macro electrons
+     *
+     * @attention distinct from boundFreeBased: three-body recombination is bound-free based but must never spawn
+     *  electrons, use this group in electron spawn logic
+     * @attention autonomousIonization also spawns electrons but is handled by its own autonomousBased kernel
+     *  instantiation in the spawn stage */
+    template<>
+    struct IsProcess<ProcessClassGroup::spawnsFreeElectron>
+    {
+        static constexpr bool check(uint8_t const processClass)
+        {
+            if((processClass == u8(ProcessClass::electronicIonization))
+               || (processClass == u8(ProcessClass::fieldIonization)))
+                return true;
+            return false;
+        }
+    };
+
+    //! processClasses capturing/removing a free electron
+    template<>
+    struct IsProcess<ProcessClassGroup::capturesFreeElectron>
+    {
+        static constexpr bool check(uint8_t const processClass)
+        {
+            if((processClass == u8(ProcessClass::threeBodyRecombination))
+               || (processClass == u8(ProcessClass::radiativeRecombination)))
                 return true;
             return false;
         }

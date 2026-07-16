@@ -83,9 +83,16 @@ namespace picongpu::particles::atomicPhysics::atomicData
         bool T_electronicIonization,
         bool T_autonomousIonization,
         bool T_fieldIonization,
+        bool T_threeBodyRecombination,
+        bool T_radiativeRecombination,
         atomicPhysics::enums::ADKLaserPolarization T_ADKLaserPolarization>
     class AtomicData : public pmacc::ISimulationData
     {
+        static_assert(
+            !T_threeBodyRecombination || T_electronicIonization,
+            "three-body recombination requires electronic ionization, its rate is the detailed balance inverse of "
+            "the electronic ionization rate");
+
     public:
         using TypeNumber = T_Number;
         using TypeValue = T_Value;
@@ -100,6 +107,8 @@ namespace picongpu::particles::atomicPhysics::atomicData
         static constexpr bool switchElectronicIonization = T_electronicIonization;
         static constexpr bool switchAutonomousIonization = T_autonomousIonization;
         static constexpr bool switchFieldIonization = T_fieldIonization;
+        static constexpr bool switchThreeBodyRecombination = T_threeBodyRecombination;
+        static constexpr bool switchRadiativeRecombination = T_radiativeRecombination;
         static constexpr s_enums::ADKLaserPolarization ADKLaserPolarization = T_ADKLaserPolarization;
 
         /// type shorthand definitions

@@ -73,6 +73,24 @@ namespace picongpu::particles::atomicPhysics::enums
     };
 
     template<>
+    struct LastResort<ChooseTransitionGroup::collisionalBoundFreeDownward>
+    {
+        static constexpr uint8_t processClass()
+        {
+            return u8(ProcessClass::threeBodyRecombination);
+        }
+    };
+
+    template<>
+    struct LastResort<ChooseTransitionGroup::radiativeBoundFreeDownward>
+    {
+        static constexpr uint8_t processClass()
+        {
+            return u8(ProcessClass::radiativeRecombination);
+        }
+    };
+
+    template<>
     struct LastResort<ChooseTransitionGroup::autonomousDownward>
     {
         static constexpr uint8_t processClass()

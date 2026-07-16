@@ -22,9 +22,10 @@
  * File contains one specialisation of ChooseTransitionGroupFor for every combination of TransitionType and
  *  TransitionDirection, giving access to the corresponding ChooseTransitionGroup,
  *
- * @attention no ChooseTransitionGroupFor specialization exists for **bound-free(upward)**, since the
- *  ChooseTransitionGroup for bound-free(upward) may be either collisionalBoundFreeUpward or fieldBoundFreeUpward and
- *  therefore no single ChooseTransitionGroup may be defined.
+ * @attention no ChooseTransitionGroupFor specialization exists for **bound-free** transitions in either direction:
+ *  bound-free(upward) may be either collisionalBoundFreeUpward or fieldBoundFreeUpward, bound-free(downward) may be
+ *  either collisionalBoundFreeDownward or radiativeBoundFreeDownward, therefore no single ChooseTransitionGroup may
+ *  be defined.
  */
 
 #pragma once

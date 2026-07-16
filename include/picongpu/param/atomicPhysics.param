@@ -122,5 +122,9 @@ namespace picongpu::atomicPhysics
         true,
         // T_fieldIonization
         true,
+        // T_threeBodyRecombination
+        false,
+        // T_radiativeRecombination
+        false,
         picongpu::particles::atomicPhysics::enums::ADKLaserPolarization::linearPolarization>;
 } // namespace picongpu::atomicPhysics

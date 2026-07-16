@@ -59,6 +59,10 @@ namespace picongpu::particles::atomicPhysics::atomicData
      * @tparam T_autonomousIonization is channel active?
      * @tparam T_electronicIonization is channel active?
      * @tparam T_fieldIonization is channel active?
+     * @tparam T_threeBodyRecombination is channel active? requires T_electronicIonization,
+     *  since its rate is the detailed balance inverse of the electronic ionization rate
+     * @tparam T_radiativeRecombination is channel active? spontaneous radiative recombination only,
+     *  emitted photon energy is not tracked(optically thin approximation)
      *
      * The atomicPhysics step relies on a model of atomic states and transitions for each
      * atomicPhysics ion species.
@@ -118,6 +122,8 @@ namespace picongpu::particles::atomicPhysics::atomicData
         bool T_electronicIonization,
         bool T_autonomousIonization,
         bool T_fieldIonization,
+        bool T_threeBodyRecombination,
+        bool T_radiativeRecombination,
         atomicPhysics::enums::ADKLaserPolarization T_ADKLaserPolarization>
     class AtomicData;
 

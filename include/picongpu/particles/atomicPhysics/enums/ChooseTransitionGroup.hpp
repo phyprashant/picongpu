@@ -53,8 +53,10 @@ namespace picongpu::particles::atomicPhysics::enums
         collisionalBoundFreeUpward, // = 2
         autonomousDownward, // = 3
         fieldBoundFreeUpward, // = 4
-        noChange, // = 5
-        FINAL_NUMBER_ENTRIES // = 6
+        collisionalBoundFreeDownward, // = 5
+        radiativeBoundFreeDownward, // = 6
+        noChange, // = 7
+        FINAL_NUMBER_ENTRIES // = 8
     };
     constexpr uint32_t numberChooseTransitionGroups = u32(ChooseTransitionGroup::FINAL_NUMBER_ENTRIES);
 } // namespace picongpu::particles::atomicPhysics::enums
@@ -74,6 +76,10 @@ namespace picongpu::particles::atomicPhysics
             return "field bound-free(upward)";
         if constexpr(u32(T_ChooseTransitionGroup) == u32(enums::ChooseTransitionGroup::autonomousDownward))
             return "autonomous(downward)";
+        if constexpr(u32(T_ChooseTransitionGroup) == u32(enums::ChooseTransitionGroup::collisionalBoundFreeDownward))
+            return "collisional bound-free(downward)";
+        if constexpr(u32(T_ChooseTransitionGroup) == u32(enums::ChooseTransitionGroup::radiativeBoundFreeDownward))
+            return "radiative bound-free(downward)";
         if constexpr(u32(T_ChooseTransitionGroup) == u32(enums::ChooseTransitionGroup::noChange))
             return "noChange";
         return "unknown";

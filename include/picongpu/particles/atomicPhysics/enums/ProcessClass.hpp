@@ -40,6 +40,8 @@ namespace picongpu::particles::atomicPhysics
             autonomousIonization = 5u,
             fieldIonization = 6u,
             ipdIonization = 7u,
+            threeBodyRecombination = 8u,
+            radiativeRecombination = 9u,
         };
     } // namespace enums
 
@@ -62,6 +64,10 @@ namespace picongpu::particles::atomicPhysics
             return "fieldIonization";
         if constexpr(u8(T_ProcessClass) == u8(enums::ProcessClass::ipdIonization))
             return "ipdIonization";
+        if constexpr(u8(T_ProcessClass) == u8(enums::ProcessClass::threeBodyRecombination))
+            return "threeBodyRecombination";
+        if constexpr(u8(T_ProcessClass) == u8(enums::ProcessClass::radiativeRecombination))
+            return "radiativeRecombination";
         return "unknown";
     }
 } // namespace picongpu::particles::atomicPhysics
