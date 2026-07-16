@@ -39,6 +39,7 @@
 #include "picongpu/particles/atomicPhysics/rateCalculation/BoundBoundTransitionRates.hpp"
 #include "picongpu/particles/atomicPhysics/rateCalculation/BoundFreeCollisionalTransitionRates.hpp"
 #include "picongpu/particles/atomicPhysics/rateCalculation/BoundFreeFieldTransitionRates.hpp"
+#include "picongpu/particles/atomicPhysics/rateCalculation/BoundFreeRadiativeTransitionRates.hpp"
 #include "picongpu/particles/atomicPhysics/stateRepresentation/ConfigNumber.hpp"
 
 #include <pmacc/algorithms/math.hpp>
@@ -286,6 +287,7 @@ namespace picongpu::particles::atomicPhysics::debug
                               // 1/(eV*m^3) * (m/sim.unit.length())^3 = = 1/(eV * sim.unit.length()^3)
                               static_cast<float_X>(
                                   densityElectrons * pmacc::math::cPow(picongpu::sim.unit.length(), 3u)),
+                              0._X,
                               0u,
                               atomicStateBuffer->getHostDataBox(),
                               boundBoundBuffer->getHostDataBox()))
@@ -306,6 +308,7 @@ namespace picongpu::particles::atomicPhysics::debug
                               energyElectronBinWidth,
                               static_cast<float_X>(
                                   densityElectrons * pmacc::math::cPow(picongpu::sim.unit.length(), 3u)),
+                              0._X,
                               0u,
                               atomicStateBuffer->getHostDataBox(),
                               boundBoundBuffer->getHostDataBox()))
@@ -345,6 +348,7 @@ namespace picongpu::particles::atomicPhysics::debug
                               energyElectronBinWidth,
                               static_cast<float_X>(
                                   densityElectrons * pmacc::math::cPow(picongpu::sim.unit.length(), 3u)),
+                              0._X,
                               // ionization potential depression
                               0._X,
                               0u,
@@ -355,6 +359,311 @@ namespace picongpu::particles::atomicPhysics::debug
 
             //! @note larger error limit required due to numerics of rate formula
             return testRelativeError<T_consoleOutput>(correctRate, rate, "collisional ionization rate", 1e-3);
+        }
+
+        /** @return true =^= test passed
+         *
+         * reference value D_ref computed by hand from the Saha detailed balance factor
+         *  D = g_lower/(2 * g_upper) * n_e * (2 * pi * hbar^2/(m_e * T_e))^(3/2) * exp(DeltaE/T_e)
+         * with T_e = 100 eV, n_e = 1e28 1/m^3, DeltaE = 105 eV, g_lower/g_upper = 162
+         * and 2022 CODATA values hbar = 1.054571817e-34 J*s, m_e = 9.1093837139e-31 kg
+         */
+        bool testThreeBodyDetailedBalanceFactor() const
+        {
+            // eV
+            float_X const temperatureElectrons = 100._X;
+            // 1/sim.unit.length()^3, = 1e28 1/m^3
+            float_X const densityTotalElectrons
+                = static_cast<float_X>(1.e28 * pmacc::math::cPow(picongpu::sim.unit.length(), 3u));
+            // eV, = 5 eV excitation energy difference + 100 eV ionization energy of charge state 0
+            float_X const deltaEnergyTransition = 105._X;
+
+            // unitless
+            float_64 const correctFactor = 7.668199883550e-01;
+            float_64 const factor = rateCalculation::BoundFreeCollisionalTransitionRates<T_n_max, true>::
+                threeBodyDetailedBalanceFactor(
+                    temperatureElectrons,
+                    densityTotalElectrons,
+                    deltaEnergyTransition,
+                    // g_lower/g_upper of the first bound-free test transition
+                    162.,
+                    1.);
+
+            return testRelativeError<T_consoleOutput>(
+                correctFactor,
+                factor,
+                "three-body recombination detailed balance factor",
+                1e-4);
+        }
+
+        /** @return true =^= test passed
+         *
+         * checks the detailed balance identity rate_3BR == D * rate_EII against the hand computed D_ref, with the
+         *  state multiplicities taken from the test data boxes, g_lower/g_upper = 162
+         */
+        bool testThreeBodyRecombinationRate() const
+        {
+            // eV
+            float_X const temperatureElectrons = 100._X;
+            // 1/sim.unit.length()^3, = 1e28 1/m^3
+            float_X const densityTotalElectrons
+                = static_cast<float_X>(1.e28 * pmacc::math::cPow(picongpu::sim.unit.length(), 3u));
+
+            // 1/sim.unit.time()
+            float_X const sumRateCollisionalIonization
+                = rateCalculation::BoundFreeCollisionalTransitionRates<T_n_max, true>::
+                    rateCollisionalIonizationTransition(
+                        energyElectron,
+                        energyElectronBinWidth,
+                        static_cast<float_X>(densityElectrons * pmacc::math::cPow(picongpu::sim.unit.length(), 3u)),
+                        0._X,
+                        // ionization potential depression
+                        0._X,
+                        0u,
+                        chargeStateBuffer->getHostDataBox(),
+                        atomicStateBuffer->getHostDataBox(),
+                        boundFreeBuffer->getHostDataBox());
+
+            // 1/sim.unit.time()
+            float_X const rate = rateCalculation::BoundFreeCollisionalTransitionRates<T_n_max, true>::
+                rateCollisionalThreeBodyRecombinationTransition(
+                    temperatureElectrons,
+                    densityTotalElectrons,
+                    sumRateCollisionalIonization,
+                    // ionization potential depression
+                    0._X,
+                    0u,
+                    chargeStateBuffer->getHostDataBox(),
+                    atomicStateBuffer->getHostDataBox(),
+                    boundFreeBuffer->getHostDataBox());
+
+            // unitless, same D_ref as in testThreeBodyDetailedBalanceFactor
+            float_64 const correctFactor = 7.668199883550e-01;
+
+            return testRelativeError<T_consoleOutput>(
+                correctFactor * static_cast<float_64>(sumRateCollisionalIonization),
+                static_cast<float_64>(rate),
+                "three-body recombination rate",
+                1e-4);
+        }
+
+        //! @return true =^= test passed, checks input guards and the n_e scaling of the detailed balance factor
+        bool testThreeBodyRecombinationGuards() const
+        {
+            using RateCalculator = rateCalculation::BoundFreeCollisionalTransitionRates<T_n_max, true>;
+
+            // 1/sim.unit.length()^3, = 1e28 1/m^3
+            float_X const densityTotalElectrons
+                = static_cast<float_X>(1.e28 * pmacc::math::cPow(picongpu::sim.unit.length(), 3u));
+
+            // barrier-free transition(strong IPD), zero temperature and zero density all have no defined factor
+            bool const passBarrierFree
+                = (RateCalculator::threeBodyDetailedBalanceFactor(100._X, densityTotalElectrons, -5._X, 162., 1.)
+                   == 0.);
+            bool const passZeroTemperature
+                = (RateCalculator::threeBodyDetailedBalanceFactor(0._X, densityTotalElectrons, 105._X, 162., 1.)
+                   == 0.);
+            bool const passZeroDensity
+                = (RateCalculator::threeBodyDetailedBalanceFactor(100._X, 0._X, 105._X, 162., 1.) == 0.);
+
+            // exponent cap prevents overflow at low temperature
+            bool const passLowTemperature = std::isfinite(
+                RateCalculator::threeBodyDetailedBalanceFactor(1.e-6_X, densityTotalElectrons, 105._X, 162., 1.));
+
+            // factor is linear in n_e, together with the density linearity of the summed collisional ionization
+            //  rate this gives the physical n_e^2 scaling of the three-body recombination rate
+            float_64 const factorSingleDensity = RateCalculator::threeBodyDetailedBalanceFactor(
+                100._X,
+                densityTotalElectrons,
+                105._X,
+                162.,
+                1.);
+            float_64 const factorDoubleDensity = RateCalculator::threeBodyDetailedBalanceFactor(
+                100._X,
+                2._X * densityTotalElectrons,
+                105._X,
+                162.,
+                1.);
+            bool const passDensityScaling = testRelativeError<false>(
+                2. * factorSingleDensity,
+                factorDoubleDensity,
+                "three-body recombination density scaling",
+                1e-6);
+
+            bool const pass = passBarrierFree && passZeroTemperature && passZeroDensity && passLowTemperature
+                && passDensityScaling;
+
+            if constexpr(T_consoleOutput)
+            {
+                if(pass)
+                    std::cout << "three-body recombination guards: * " << std::endl;
+                else
+                    std::cout << "three-body recombination guards: x  barrierFree: " << passBarrierFree
+                              << " zeroTemperature: " << passZeroTemperature << " zeroDensity: " << passZeroDensity
+                              << " lowTemperature: " << passLowTemperature
+                              << " densityScaling: " << passDensityScaling << std::endl;
+            }
+            return pass;
+        }
+
+        /** @return true =^= test passed
+         *
+         * reference values from lib/python/picongpu/extra/utils/FLYonPICRateCalculationReference/, mock bound-free
+         *  transitions have cxin1..8 = 1..8, i.e. fit amplitude cxin5 = 5, edge cxin6 = 6 eV, upper validity limit
+         *  cxin8 = 8 eV
+         */
+        bool testScofieldPhotoIonizationCrossSection() const
+        {
+            // 1e6b, at E_gamma = 7 eV, inside [cxin6, cxin8]
+            float_X const correctCrossSection = 4.571515907410e+01;
+            float_X const crossSection = rateCalculation::BoundFreeRadiativeTransitionRates<T_n_max, true>::
+                scofieldPhotoIonizationCrossSection(
+                    // eV
+                    7._X,
+                    1u,
+                    boundFreeBuffer->getHostDataBox());
+
+            bool const passValue = testRelativeError<T_consoleOutput>(
+                correctCrossSection,
+                crossSection,
+                "scofield photoionization cross section",
+                static_cast<float_X>(1e-5));
+
+            // fit is invalid above the upper validity limit cxin8
+            bool const passUpperLimit
+                = (rateCalculation::BoundFreeRadiativeTransitionRates<T_n_max, true>::
+                       scofieldPhotoIonizationCrossSection(9._X, 1u, boundFreeBuffer->getHostDataBox())
+                   == 0._X);
+
+            if constexpr(T_consoleOutput)
+                if(!passUpperLimit)
+                    std::cout << "scofield cross section upper validity limit: x" << std::endl;
+
+            return passValue && passUpperLimit;
+        }
+
+        //! @return true =^= test passed
+        bool testKramersPhotoIonizationCrossSection() const
+        {
+            // 1e6b, at E_gamma = 205 eV, DeltaE = 105 eV, screenedCharge = 5, transitionMultiplicity = 162
+            float_X const correctCrossSection = 1.243048283842e+01;
+            float_X const crossSection = rateCalculation::BoundFreeRadiativeTransitionRates<T_n_max, true>::
+                kramersPhotoIonizationCrossSection(
+                    // eV
+                    205._X,
+                    // eV
+                    105._X,
+                    5._X,
+                    162.);
+
+            return testRelativeError<T_consoleOutput>(
+                correctCrossSection,
+                crossSection,
+                "kramers photoionization cross section",
+                static_cast<float_X>(1e-5));
+        }
+
+        /** @return true =^= test passed
+         *
+         * Milne relation cross section, fit path: mock transition 1 with DeltaE = 5 eV(ionization energy of charge
+         *  state 1, no excitation energy difference), E_e = 2 eV -> E_gamma = 7 eV,
+         *  g_lower/g_upper = 1568/16 = 98
+         */
+        bool testRadiativeRecombinationCrossSection() const
+        {
+            // 1e6b
+            float_X const correctCrossSection = 1.074638581409e-01;
+            float_X const crossSection = rateCalculation::BoundFreeRadiativeTransitionRates<T_n_max, true>::
+                radiativeRecombinationCrossSection(
+                    // eV
+                    2._X,
+                    // ionization potential depression, eV
+                    0._X,
+                    1u,
+                    chargeStateBuffer->getHostDataBox(),
+                    atomicStateBuffer->getHostDataBox(),
+                    boundFreeBuffer->getHostDataBox());
+
+            bool const passFit = testRelativeError<T_consoleOutput>(
+                correctCrossSection,
+                crossSection,
+                "radiative recombination cross section(fit)",
+                static_cast<float_X>(1e-4));
+
+            /* fallback path: mock transition 0 has DeltaE = 105 eV > cxin8 = 8 eV -> Kramers fallback,
+             *  E_e = 100 eV -> E_gamma = 205 eV, g_lower/g_upper = 254016/1568 = 162,
+             *  transitionMultiplicity = 1, screenedCharge = 5 */
+            // 1e6b
+            float_X const correctCrossSectionFallback = 5.114530272410e-03;
+            float_X const crossSectionFallback = rateCalculation::BoundFreeRadiativeTransitionRates<T_n_max, true>::
+                radiativeRecombinationCrossSection(
+                    // eV
+                    100._X,
+                    // ionization potential depression, eV
+                    0._X,
+                    0u,
+                    chargeStateBuffer->getHostDataBox(),
+                    atomicStateBuffer->getHostDataBox(),
+                    boundFreeBuffer->getHostDataBox());
+
+            bool const passFallback = testRelativeError<T_consoleOutput>(
+                correctCrossSectionFallback,
+                crossSectionFallback,
+                "radiative recombination cross section(fallback)",
+                static_cast<float_X>(1e-4));
+
+            // zero electron energy and barrier free transitions have no cross section
+            bool const passGuards
+                = (rateCalculation::BoundFreeRadiativeTransitionRates<T_n_max, true>::
+                       radiativeRecombinationCrossSection(
+                           0._X,
+                           0._X,
+                           1u,
+                           chargeStateBuffer->getHostDataBox(),
+                           atomicStateBuffer->getHostDataBox(),
+                           boundFreeBuffer->getHostDataBox())
+                   == 0._X)
+                && (rateCalculation::BoundFreeRadiativeTransitionRates<T_n_max, true>::
+                        radiativeRecombinationCrossSection(
+                            2._X,
+                            // ionization potential depression larger than the threshold, eV
+                            1000._X,
+                            1u,
+                            chargeStateBuffer->getHostDataBox(),
+                            atomicStateBuffer->getHostDataBox(),
+                            boundFreeBuffer->getHostDataBox())
+                    == 0._X);
+
+            if constexpr(T_consoleOutput)
+                if(!passGuards)
+                    std::cout << "radiative recombination cross section guards: x" << std::endl;
+
+            return passFit && passFallback && passGuards;
+        }
+
+        //! @return true =^= test passed
+        bool testRadiativeRecombinationRate() const
+        {
+            // 1/s, fit path bin rate at E_e = 2 eV, binWidth 10 eV, density 1e28 1/(eV m^3)
+            float_64 const correctRate = 9.013674032225e+11;
+            float_64 const rate
+                = static_cast<float_64>(
+                      rateCalculation::BoundFreeRadiativeTransitionRates<T_n_max, true>::
+                          rateRadiativeRecombinationTransition(
+                              // eV
+                              2._X,
+                              energyElectronBinWidth,
+                              static_cast<float_X>(
+                                  densityElectrons * pmacc::math::cPow(picongpu::sim.unit.length(), 3u)),
+                              // ionization potential depression
+                              0._X,
+                              1u,
+                              chargeStateBuffer->getHostDataBox(),
+                              atomicStateBuffer->getHostDataBox(),
+                              boundFreeBuffer->getHostDataBox()))
+                  * 1. / sim.unit.time(); // 1/s
+
+            return testRelativeError<T_consoleOutput>(correctRate, rate, "radiative recombination rate", 1e-3);
         }
 
         //! @return true =^= test passed
@@ -391,7 +700,7 @@ namespace picongpu::particles::atomicPhysics::debug
         //! @return true =^= all tests passed
         bool testAll()
         {
-            constexpr uint8_t numberTests = 8;
+            constexpr uint8_t numberTests = 15;
             bool pass[numberTests];
             pass[0] = testCollisionalExcitationCrossSection();
             pass[1] = testCollisionalDeexcitationCrossSection();
@@ -401,6 +710,13 @@ namespace picongpu::particles::atomicPhysics::debug
             pass[5] = testSpontaneousRadiativeDeexcitationRate();
             pass[6] = testCollisionalIonizationRate();
             pass[7] = testADKIonizationRate();
+            pass[8] = testThreeBodyDetailedBalanceFactor();
+            pass[9] = testThreeBodyRecombinationRate();
+            pass[10] = testThreeBodyRecombinationGuards();
+            pass[11] = testScofieldPhotoIonizationCrossSection();
+            pass[12] = testKramersPhotoIonizationCrossSection();
+            pass[13] = testRadiativeRecombinationCrossSection();
+            pass[14] = testRadiativeRecombinationRate();
 
             bool passTotal = true;
             for(uint8_t i = 0u; i < numberTests; ++i)

@@ -23,16 +23,16 @@
 #pragma once
 
 #include "picongpu/defines.hpp"
-#include "picongpu/particles/atomicPhysics/debug/kernel/DumpRateCacheToConsole.kernel"
 #include "picongpu/particles/atomicPhysics/localHelperFields/RateCacheField.hpp"
 #include "picongpu/particles/param.hpp"
 
 #include <pmacc/Environment.hpp>
-#include <pmacc/mappings/kernel/AreaMapping.hpp>
 #include <pmacc/particles/meta/FindByNameOrType.hpp>
-#include <pmacc/type/Area.hpp>
 
 #include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <string>
 
 namespace picongpu::particles::atomicPhysics::stage
 {
@@ -51,18 +51,34 @@ namespace picongpu::particles::atomicPhysics::stage
         //! call of kernel for every superCell
         HINLINE void operator()(picongpu::MappingDesc const mappingDesc) const
         {
-            // full local domain, no guards
-            pmacc::AreaMapping<CORE + BORDER, MappingDesc> mapper(mappingDesc);
             pmacc::DataConnector& dc = pmacc::Environment<>::get().DataConnector();
 
             auto& rateCacheField = *dc.get<picongpu::particles::atomicPhysics::localHelperFields::
                                                RateCacheField<picongpu::MappingDesc, IonSpecies>>(
                 IonSpecies::FrameType::getName() + "_rateCacheField");
 
-            using DumpToConsole = picongpu::particles::atomicPhysics::kernel::DumpRateCacheToConsoleKernel;
+            // copy rate cache from device to host so we can write it from host side
+            rateCacheField.synchronize();
 
-            PMACC_LOCKSTEP_KERNEL(DumpToConsole())
-                .template config<1u>(mapper.getGridDim())(mapper, rateCacheField.getDeviceDataBox());
+            std::string const filename = "rateCache_" + IonSpecies::FrameType::getName() + ".txt";
+            std::ofstream out(filename, std::ios::out);
+            if(!out.is_open())
+            {
+                std::cerr << "atomicPhysics ERROR: could not open " << filename << " for writing" << std::endl;
+                return;
+            }
+
+            auto hostDataBox = rateCacheField.superCellField->getHostBuffer().getDataBox();
+            auto const gridSuperCells = mappingDesc.getGridSuperCellsWithoutGuards();
+
+            // dimension agnostic iteration, works for both 2D and 3D simulations
+            int const numberSuperCells = gridSuperCells.productOfComponents();
+            for(int linearIdx = 0; linearIdx < numberSuperCells; ++linearIdx)
+            {
+                pmacc::DataSpace<picongpu::simDim> const superCellFieldIdx
+                    = pmacc::math::mapToND(gridSuperCells, linearIdx);
+                hostDataBox(superCellFieldIdx).printToFile(out, superCellFieldIdx);
+            }
         }
     };
 } // namespace picongpu::particles::atomicPhysics::stage

@@ -10,6 +10,7 @@ License: GPLv3+
 import BoundBoundTransitions as boundbound
 import BoundFreeCollisionalTransitions as boundfreecollisional
 import BoundFreeFieldTransitions as boundfreefield
+import BoundFreeRadiativeTransitions as boundfreeradiative
 
 import scipy.constants as const
 import numpy as np
@@ -72,6 +73,73 @@ if __name__ == "__main__":
                 screenedCharge,
                 lowerStateLevelVectorBoundFree,
                 upperStateLevelVectorBoundFree,
+            )
+        )
+    )
+
+    print("- bound-free radiative")
+    # bound-free radiative transition data, matches TestRateCalculation.hpp mock transition 1
+    #  lower state (charge state 1), upper state (charge state 2), ionization energy chargeState 1 = 5 eV
+    radiativeLowerStateLevelVector = (1, 1, 0, 0, 0, 0, 1, 0, 0, 0)
+    radiativeUpperStateLevelVector = (1, 1, 0, 0, 0, 0, 0, 0, 0, 0)
+    # eV, ionizationEnergy(5 eV) + excitationEnergyDifference(0 eV), no IPD
+    radiativeDeltaEnergy = 5.0
+    # eV, inside the fit validity window [edge cxin6 = 6 eV, cxin8 = 8 eV]
+    energyElectronRadiative = 2.0
+    radiativeTransitionMultiplicity = boundfreecollisional.BoundFreeCollisionalTransitions._multiplicity(
+        radiativeLowerStateLevelVector, radiativeUpperStateLevelVector
+    )
+    print(
+        "\t scofield photoionization cross section:  {0:.12e} 1e6*barn".format(
+            boundfreeradiative.BoundFreeRadiativeTransitions.scofieldPhotoIonizationCrossSection(
+                energyElectronRadiative + radiativeDeltaEnergy, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0
+            )
+        )
+    )
+    print(
+        "\t kramers photoionization cross section:   {0:.12e} 1e6*barn".format(
+            boundfreeradiative.BoundFreeRadiativeTransitions.kramersPhotoIonizationCrossSection(
+                205.0, 105.0, 5.0, 162.0
+            )
+        )
+    )
+    print(
+        "\t radiative recombination cross section:   {0:.12e} 1e6*barn".format(
+            boundfreeradiative.BoundFreeRadiativeTransitions.radiativeRecombinationCrossSection(
+                energyElectronRadiative,
+                radiativeDeltaEnergy,
+                5.0,
+                radiativeLowerStateLevelVector,
+                radiativeUpperStateLevelVector,
+                radiativeTransitionMultiplicity,
+                1.0,
+                2.0,
+                3.0,
+                4.0,
+                5.0,
+                6.0,
+                8.0,
+            )
+        )
+    )
+    print(
+        "\t radiative recombination rate:  \t  {0:.12e} 1/s".format(
+            boundfreeradiative.BoundFreeRadiativeTransitions.rateRadiativeRecombination(
+                energyElectronRadiative,
+                energyElectronBinWidth,
+                densityElectrons,
+                radiativeDeltaEnergy,
+                5.0,
+                radiativeLowerStateLevelVector,
+                radiativeUpperStateLevelVector,
+                radiativeTransitionMultiplicity,
+                1.0,
+                2.0,
+                3.0,
+                4.0,
+                5.0,
+                6.0,
+                8.0,
             )
         )
     )
