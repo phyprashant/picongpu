@@ -29,12 +29,23 @@ FLYonPIC is based on the [FlyCHK]_ atomic model and currently implements the fol
 - autonomous ionization
 - pressure ionization (according to Stewart-Pyatt ionization potential depression)
 - field ionization [BSI + ADK] (with Stewart-Pyatt ionization potential depression)
+- three body electronic recombination (Maxwellian detailed balance inverse of electron impact ionization, with Stewart-Pyatt ionization potential depression)
+- spontaneous radiative recombination (Milne relation applied to the bound-free photoionization cross-section fit of the atomic input data, with a hydrogenic Kramers fallback, evaluated on the binned electron spectrum, with Stewart-Pyatt ionization potential depression)
+
+.. attention::
+
+   Three body recombination is a **Maxwellian detailed-balance model**: the electron impact ionization rate of the same transition is summed over the binned electron spectrum, then multiplied by a Saha detailed-balance factor computed from the histogram's density and effective temperature moments.
+   The result is only strictly valid for Maxwellian electron spectra; for non-Maxwellian spectra it is an uncontrolled approximation and must not be used as evidence of non-thermal detailed-balance correctness.
+   The captured electron weight is removed from the free electron macro particles by a statistical per-histogram-bin mean-field reweighting, not by resolved three-particle collisions.
+
+.. attention::
+
+   Radiative recombination is spontaneous only, stimulated recombination and photoionization require a radiation field model and are not implemented yet.
+   The emitted photon is not tracked: its energy, the captured electron's kinetic energy plus the released binding energy, leaves the simulation.
+   This optically thin photon-escape closure can be a poor approximation for dense or extended laser-driven plasmas, where recombination continuum photons may be reabsorbed or drive photoionization elsewhere; it is a first radiation closure, not radiation-transport-coupled recombination.
+   The captured electron weight is removed by the same statistical per-histogram-bin mean-field reweighting as for three body recombination.
 
 FLYonPIC solves the atomic rate equation time dependent and explicit with adaptive sub-stepping of the PIC-cycle and is energy and charge conserving and in the thermal average momentum conserving.
-
-In addition FLYonPIC will be extended in the near future to include:
-
-- three body electronic recombination
 
 Momentum conservation and photonic processes are also planned in the future.
 
@@ -183,7 +194,7 @@ Requirements:
 
 Bound-Free Transition Input Data:
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Each bound-free transition is associated with a electronic ionization, and in future one field ionization and one recombination transition.
+Each bound-free transition is associated with a electronic ionization, a three body recombination, a radiative recombination, and in future one field ionization transition.
 
 One line per transition, format of a line in the input file:
 
@@ -193,7 +204,10 @@ One line per transition, format of a line in the input file:
 
 .. note::
 
-   cxin* ... gaunt coefficient, currently unused
+   cxin1 to cxin8 are the SCFLY/FLYCHK photoionization cross-section fit of the transition, used by radiative recombination via the Milne relation:
+   :math:`\sigma_\mathrm{PI}(E) = 10^{-18}\,\mathrm{cm}^2 \cdot \mathrm{cxin5} \cdot \exp\left(\mathrm{cxin1} + L(\mathrm{cxin2} + L(\mathrm{cxin3} + L \cdot \mathrm{cxin4}))\right) \cdot 13.606/\mathrm{cxin6}`, with :math:`L = \max(\ln(E/\mathrm{cxin6}), 0)`.
+   cxin6 is the fit edge energy in eV, distinct from the IPD-shifted transition threshold, cxin8 is the upper validity limit in eV, and cxin7 is unused.
+   The fit is considered invalid, and a hydrogenic Kramers fallback cross section is used instead, if cxin5 <= 1e-30, cxin6 <= 0, or cxin8 does not exceed the transition threshold, e.g. for all-zero coefficients.
 
 .. note::
 
