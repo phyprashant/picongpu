@@ -301,6 +301,22 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
             T_AtomicStateDataBox const atomicStateDataBox,
             T_BoundFreeTransitionDataBox const boundFreeTransitionDataBox)
         {
+#if defined(PARAM_SUPPRESS_RECOMB_ABOVE_NMAX) && (PARAM_SUPPRESS_RECOMB_ABOVE_NMAX > 0)
+            // momentary diagnostic: suppress radiative recombination into high-n Rydberg
+            // states (highest occupied shell >= PARAM_SUPPRESS_RECOMB_ABOVE_NMAX) whose rate
+            // coefficients are over-predicted vs native SCFLY. Photoionization is left untouched.
+            {
+                using GuardConfigNumber = typename T_AtomicStateDataBox::ConfigNumber;
+                auto const guardLevelVector = GuardConfigNumber::getLevelVector(atomicStateDataBox.configNumber(
+                    boundFreeTransitionDataBox.lowerStateCollectionIndex(transitionCollectionIndex)));
+                uint8_t guardNMax = 0u;
+                for(uint8_t guardN = 0u; guardN < GuardConfigNumber::numberLevels; ++guardN)
+                    if(guardLevelVector[guardN] > static_cast<uint8_t>(0u))
+                        guardNMax = static_cast<uint8_t>(guardN + 1u);
+                if(guardNMax >= static_cast<uint8_t>(PARAM_SUPPRESS_RECOMB_ABOVE_NMAX))
+                    return 0._X;
+            }
+#endif
             if constexpr(picongpu::atomicPhysics::debug::fixedRateMatrix::USE_FIXED_RATE_INSTEAD_OF_RATE_CALCULATION)
                 return 0._X;
 
