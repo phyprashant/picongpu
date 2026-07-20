@@ -182,6 +182,9 @@ namespace picongpu::particles::atomicPhysics::kernel
                         uint32_t const atomicStateCollectionIndex = linearIdx % T_numberAtomicStates;
 
                         bool const atomicStatePresent = rateCache.present(atomicStateCollectionIndex);
+                        if constexpr(!picongpu::atomicPhysics::debug::rateCache::PRINT_TO_CONSOLE)
+                            if(!atomicStatePresent)
+                                return;
 
                         uint32_t numberTransitions;
                         if constexpr(isUpward)
