@@ -99,19 +99,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                     }
                     else
                     {
-                        /* clamp loss rate to the maximum sub-step limit, see atomicPhysics.param:
-                         * states with faster loss rates are assumed to be in rate fix point
-                         * (equilibrium) and must not reduce the time step further
-                         * unit: 1/unit_time() */
-                        float_X const maxLossRate = picongpu::atomicPhysics::RateSolverParam::timeStepAlpha
-                            * static_cast<float_X>(
-                                  picongpu::atomicPhysics::RateSolverParam::maximumNumberSubStepsPerPICTimeStep)
-                            / sim.pic.getDt();
-
-                        if(rateCacheLossRate > maxLossRate)
-                            lossRateState = maxLossRate;
-                        else
-                            lossRateState = rateCacheLossRate;
+                        lossRateState = rateCacheLossRate;
                     }
 
                     if constexpr(picongpu::atomicPhysics::debug::kernel::calculateTimeStep::
