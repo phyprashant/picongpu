@@ -22,6 +22,7 @@
 #include "picongpu/defines.hpp"
 #include "picongpu/particles/atomicPhysics/CheckForInvalidChooseTransitionGroup.hpp"
 #include "picongpu/particles/atomicPhysics/ConvertEnum.hpp"
+#include "picongpu/particles/atomicPhysics/DeltaEnergyTransition.hpp"
 #include "picongpu/particles/atomicPhysics/electronDistribution/CachedHistogram.hpp"
 #include "picongpu/particles/atomicPhysics/enums/ChooseTransitionGroup.hpp"
 #include "picongpu/particles/atomicPhysics/enums/ProcessClass.hpp"
@@ -42,6 +43,37 @@ namespace picongpu::particles::atomicPhysics::kernel
 {
     namespace s_enums = picongpu::particles::atomicPhysics::enums;
 
+    /** capture weight of one electron histogram bin for three-body recombination
+     *
+     * bin electron number density times the energy transfer suppression of the capture, see
+     *  BoundFreeCollisionalTransitionRates::threeBodyCaptureWeight()
+     *
+     * @tparam T_n_max number of levels of atomic states in input
+     *
+     * @param cachedHistogram cached local electron histogram
+     * @param binIndex regular histogram-bin index
+     * @param deltaEnergyTransition IPD-shifted energy difference of the chosen transition, [eV]
+     *
+     * @return unit: 1/sim.unit.length()^3, 0 for empty bins
+     */
+    template<uint8_t T_n_max, typename T_CachedHistogram>
+    HDINLINE float_X captureWeightOfBin(
+        T_CachedHistogram const& cachedHistogram,
+        uint32_t const binIndex,
+        // eV
+        float_X const deltaEnergyTransition)
+    {
+        // 1/sim.unit.length()^3
+        float_X const binDensity = cachedHistogram.density[binIndex] * cachedHistogram.binWidth[binIndex];
+        if(binDensity <= 0._X)
+            return 0._X;
+
+        /* 1/sim.unit.length()^3 * unitless, unit: 1/sim.unit.length()^3 */
+        return binDensity
+            * picongpu::particles::atomicPhysics::rateCalculation::BoundFreeCollisionalTransitionRates<
+                T_n_max>::threeBodyCaptureWeight(cachedHistogram.energy[binIndex], deltaEnergyTransition);
+    }
+
     /** choose specific transition from previously selected transitionType for downward bound-free collisional
      *  transitions, i.e. three-body recombination
      *
@@ -50,9 +82,14 @@ namespace picongpu::particles::atomicPhysics::kernel
      * The transition corresponding to the interval containing r is the chosen and accepted.
      *
      * In addition a capture bin is selected for the captured electron, with each bin weighted by its share of the
-     *  local electron weight, i.e. uniform capture probability per physical free electron.
-     * @attention Maxwellian model approximation! A microreversible model would instead prefer capturing low energy
-     *  electrons, this requires a differential ionization cross section and is not implemented yet.
+     *  local electron weight times the energy transfer suppression of the capture, see captureWeightOfBin(). The
+     *  capture is therefore biased towards the slow electrons of the distribution, as required by microreversibility
+     *  with the inverse collisional ionization. The selection depends on the transition energy and is therefore
+     *  rolled after the transition has been chosen.
+     * @attention the suppression uses the analytic classical(Thomson) 1/(E_e + DeltaE)^2 energy transfer scaling as
+     *  a stand-in for the shape of a true differential ionization cross section, which is not available in the
+     *  input data. It fixes the qualitative bias of a pure electron-number weighting, it is not an exact
+     *  microreversible capture spectrum.
      *
      * @tparam T_Histogram type of the histogram
      * @tparam T_n_max number of levels of atomic states in input
@@ -235,37 +272,6 @@ namespace picongpu::particles::atomicPhysics::kernel
                         return;
                     }
 
-                    // select capture bin for the captured electron, weighted by bin electron weight share
-                    float_X const rBin = rngGeneratorFloat();
-                    uint32_t captureBinIndex = 0u;
-                    bool captureBinFound = false;
-                    float_X cumSumBin = 0._X;
-                    for(uint32_t binIndex = 0u; binIndex < numberBins; ++binIndex)
-                    {
-                        // 1/sim.unit.length()^3
-                        float_X const binDensity
-                            = cachedHistogram.density[binIndex] * cachedHistogram.binWidth[binIndex];
-                        if(binDensity <= 0._X)
-                            continue;
-
-                        // last non empty bin is the fallback for numerically incomplete cumulative sums
-                        captureBinIndex = binIndex;
-                        captureBinFound = true;
-
-                        cumSumBin += binDensity / densityElectrons;
-                        // inclusive limit, to make sure that rBin==1 is assigned a bin
-                        if(rBin <= cumSumBin)
-                            break;
-                    }
-
-                    /* no electrons in the histogram, but stateTotalLossrate > 0 should not be possible since the
-                     *  three-body recombination rate is proportional to the electron density, reject to be safe */
-                    if(!captureBinFound)
-                    {
-                        setNoChangeTransition(ion);
-                        return;
-                    }
-
                     // get random number
                     float_X const r = rngGeneratorFloat();
 
@@ -274,7 +280,14 @@ namespace picongpu::particles::atomicPhysics::kernel
                     /* last transition with non-zero rate, fallback for numerically incomplete cumulative sums;
                      *  zero-rate transitions must never be selected */
                     uint32_t lastTransitionIndexWithRate = 0u;
+                    // eV, IPD-shifted transition energy belonging to lastTransitionIndexWithRate
+                    float_X lastDeltaEnergyWithRate = 0._X;
                     bool foundTransitionWithRate = false;
+
+                    uint32_t chosenTransitionIndex = 0u;
+                    // eV, IPD-shifted transition energy belonging to chosenTransitionIndex
+                    float_X chosenDeltaEnergy = 0._X;
+                    bool transitionChosen = false;
                     for(uint32_t transitionID = 0u; transitionID < numberTransitions; ++transitionID)
                     {
                         uint32_t const transitionIndex = transitionID + startIndexTransitionBlock;
@@ -327,7 +340,18 @@ namespace picongpu::particles::atomicPhysics::kernel
                         if(rateTransition <= 0._X)
                             continue;
 
+                        /* eV, IPD-shifted energy released by the recombination, sets the energy transfer
+                         *  suppression of the capture bin selection below */
+                        float_X const deltaEnergyTransition
+                            = picongpu::particles::atomicPhysics::DeltaEnergyTransition::get(
+                                transitionIndex,
+                                atomicStateDataDataBox,
+                                transitionDataBox,
+                                ionizationPotentialDepression,
+                                chargeStateDataDataBox);
+
                         lastTransitionIndexWithRate = transitionIndex;
+                        lastDeltaEnergyWithRate = deltaEnergyTransition;
                         foundTransitionWithRate = true;
 
                         cumSum += rateTransition / stateTotalLossrate;
@@ -336,12 +360,10 @@ namespace picongpu::particles::atomicPhysics::kernel
                         if(r <= cumSum)
                         {
                             // found chosen transition
-                            updateIon(
-                                ion,
-                                u8(picongpu::particles::atomicPhysics::enums::ProcessClass::threeBodyRecombination),
-                                transitionIndex,
-                                captureBinIndex);
-                            return;
+                            chosenTransitionIndex = transitionIndex;
+                            chosenDeltaEnergy = deltaEnergyTransition;
+                            transitionChosen = true;
+                            break;
                         }
                     }
 
@@ -353,11 +375,52 @@ namespace picongpu::particles::atomicPhysics::kernel
                         return;
                     }
 
-                    // numerically incomplete cumulative sum, select last transition with non-zero rate
+                    if(!transitionChosen)
+                    {
+                        // numerically incomplete cumulative sum, select last transition with non-zero rate
+                        chosenTransitionIndex = lastTransitionIndexWithRate;
+                        chosenDeltaEnergy = lastDeltaEnergyWithRate;
+                    }
+
+                    /* select the histogram bin of the captured electron, weighted by the bin's electron number
+                     *  share times the energy transfer suppression of the capture, see threeBodyCaptureWeight().
+                     *
+                     * @attention selection only, the total three-body recombination rate is unchanged by this. */
+                    float_X sumCaptureWeight = 0._X;
+                    for(uint32_t binIndex = 0u; binIndex < numberBins; ++binIndex)
+                        sumCaptureWeight += captureWeightOfBin<T_n_max>(cachedHistogram, binIndex, chosenDeltaEnergy);
+
+                    /* no electrons in the histogram, but stateTotalLossrate > 0 should not be possible since the
+                     *  three-body recombination rate is proportional to the electron density, reject to be safe */
+                    if(sumCaptureWeight <= 0._X)
+                    {
+                        setNoChangeTransition(ion);
+                        return;
+                    }
+
+                    float_X const rBin = rngGeneratorFloat();
+                    uint32_t captureBinIndex = 0u;
+                    float_X cumSumBin = 0._X;
+                    for(uint32_t binIndex = 0u; binIndex < numberBins; ++binIndex)
+                    {
+                        float_X const captureWeight
+                            = captureWeightOfBin<T_n_max>(cachedHistogram, binIndex, chosenDeltaEnergy);
+                        if(captureWeight <= 0._X)
+                            continue;
+
+                        // last bin with non-zero capture weight is the fallback for incomplete cumulative sums
+                        captureBinIndex = binIndex;
+
+                        cumSumBin += captureWeight / sumCaptureWeight;
+                        // inclusive limit, to make sure that rBin==1 is assigned a bin
+                        if(rBin <= cumSumBin)
+                            break;
+                    }
+
                     updateIon(
                         ion,
                         u8(picongpu::particles::atomicPhysics::enums::ProcessClass::threeBodyRecombination),
-                        lastTransitionIndexWithRate,
+                        chosenTransitionIndex,
                         captureBinIndex);
                 });
         }

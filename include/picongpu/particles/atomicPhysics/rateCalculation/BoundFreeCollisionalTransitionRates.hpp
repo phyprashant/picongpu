@@ -351,6 +351,44 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
                 * lambdaDeBroglieCubed * volumeConversionFactor * math::exp(exponent);
         }
 
+        /** relative probability of capturing a free electron of given energy in three-body recombination
+         *
+         * Three-body recombination captures a free electron by transferring its kinetic energy plus the released
+         *  binding energy to a second, spectator, free electron. The cross section for such an energy transfer
+         *  falls off as 1/(E_e + DeltaE)^2, giving the capture preference
+         *  w(E_e) = (DeltaE / (E_e + DeltaE))^2, normalised to w(0) = 1.
+         *
+         * This is the classical(Thomson) energy transfer scaling of three-body capture and equals, up to
+         *  normalisation, the shape of the ejected electron spectrum of the inverse collisional ionization, as
+         *  required by detailed balance. Capture is therefore strongly biased towards the slow electrons of the
+         *  distribution, in contrast to a selection weighted by electron number alone, which would draw the
+         *  captured electron from the bulk of the distribution, <E_e> = 3/2 * T_e.
+         *
+         * @attention shape only! This distributes the capture over the electron histogram, the total three-body
+         *  recombination rate is set by rateCollisionalThreeBodyRecombinationTransition() and is unaffected.
+         *
+         * @param energyElectron kinetic energy of the candidate captured electron(/electron bin), [eV]
+         * @param deltaEnergyTransition IPD-shifted energy difference of the transition, [eV]
+         *
+         * @return unitless, in (0, 1]; 1 for undefined input(DeltaE <= 0), falling back to weighting the bins by
+         *  electron number alone
+         */
+        HDINLINE static float_X threeBodyCaptureWeight(
+            // eV
+            float_X const energyElectron,
+            // eV
+            float_X const deltaEnergyTransition)
+        {
+            /* barrier-free transitions (DeltaE <= 0, possible with strong IPD) have no defined energy transfer
+             *  suppression, weight by electron number alone */
+            if((deltaEnergyTransition <= 0._X) || (energyElectron <= 0._X))
+                return 1._X;
+
+            // unitless, in (0, 1)
+            float_X const suppression = deltaEnergyTransition / (energyElectron + deltaEnergyTransition);
+            return suppression * suppression;
+        }
+
         /** rate of collisional three-body recombination for a given bound-free transition
          *
          * Maxwellian detailed balance inverse of the collisional ionization rate of the same transition,
