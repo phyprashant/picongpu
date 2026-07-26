@@ -126,11 +126,28 @@ namespace picongpu::atomicPhysics::debug
 #endif
         constexpr bool FORCE_CONSTANT_ELECTRON_TEMPERATURE = PARAM_FORCE_CONSTANT_ELECTRON_TEMPERATURE;
 
+#ifdef PARAM_ATOMIC_RATE_CACHE_USE_ANALYTIC_MAXWELLIAN
+        constexpr bool USE_ANALYTIC_MAXWELLIAN_ELECTRON_HISTOGRAM
+            = PARAM_ATOMIC_RATE_CACHE_USE_ANALYTIC_MAXWELLIAN;
+#else
+        constexpr bool USE_ANALYTIC_MAXWELLIAN_ELECTRON_HISTOGRAM = false;
+#endif
+
+#ifndef PARAM_ATOMIC_RATE_CACHE_ANALYTIC_ELECTRON_DENSITY_SI
+#    define PARAM_ATOMIC_RATE_CACHE_ANALYTIC_ELECTRON_DENSITY_SI 1.e28
+#endif
+
         //! fixed temperature setting
         struct TemperatureParam
         {
             //! Initial temperature, [keV]
             static constexpr float_64 temperature = 1.;
+        };
+
+        //! fixed electron density used by the analytic Maxwellian histogram, [m^-3]
+        struct AnalyticMaxwellianParam
+        {
+            static constexpr float_64 electronDensitySI = PARAM_ATOMIC_RATE_CACHE_ANALYTIC_ELECTRON_DENSITY_SI;
         };
     } // namespace scFlyComparison
 
