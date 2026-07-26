@@ -28,6 +28,7 @@
 #include <pmacc/algorithms/math.hpp>
 
 #include <cstdint>
+#include <limits>
 
 /** @file implements calculation of rates for radiative bound-free atomic physics transitions
  *
@@ -268,7 +269,11 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
                 * pmacc::math::cPow(static_cast<float_64>(energyPhoton), 2u)
                 / static_cast<float_64>(energyElectron) * static_cast<float_64>(sigmaPhotoIonization);
 
-            return static_cast<float_X>(sigmaRadiativeRecombination);
+            /* the cross section diverges as 1/E_e towards zero electron energy, protect the float_X cast for a
+             *  very low lying first histogram bin; overlarge rates only force smaller atomicPhysics sub-steps */
+            return static_cast<float_X>(pmacc::math::min(
+                sigmaRadiativeRecombination,
+                static_cast<float_64>(std::numeric_limits<float_X>::max())));
         }
 
         /** rate of spontaneous radiative recombination for a bound-free transition and a free electron bin
