@@ -21,19 +21,68 @@
 
 #include "picongpu/defines.hpp"
 
+#include <pmacc/algorithms/math.hpp>
 #include <pmacc/memory/Array.hpp>
 
 #include <cstdint>
 
+/** @file bin-center density reconstruction for collisional rate integration
+ *
+ * The histogram stores, per bin, the bin-MEAN differential electron density
+ *   rhoBar_i = 1/h * integral over bin of rho(E) dE.
+ * The midpoint rate integration however samples the cross section at the bin center
+ * and wants the density AT that center, rho(c). For a flat spectrum the two agree, but
+ * the log-spaced bins are ~16% wide, so for a steeply falling spectrum (h/T_e of order
+ * one) rhoBar over-weights the cold lower bin edge and the rate is over-predicted.
+ *
+ * Modelling the density locally as an exponential, rho(E) = rho(c) * exp(k*(E-c)),
+ * the stored bin mean is
+ *   rhoBar = rho(c) * sinh(x)/x,   x = k*h/2,
+ * so the center density follows from the stored mean by the scalar factor
+ *   f = x/sinh(x) <= 1.
+ * The decay constant k is estimated from the neighbouring bin mean,
+ *   k = ln(rhoBar_{i+1}/rhoBar_i) / (c_{i+1} - c_i).
+ *
+ * f is a PER-BIN scalar evaluated once in fill(), so the correction costs nothing in the
+ * (bin x atomicState x transition) rate loops. It is a local two-bin fit, not a global
+ * Maxwellian assumption, and is positivity preserving by construction.
+ *
+ * @attention only the rate integration uses the reconstructed density. electronDensity(),
+ *  temperatureEnergy() and the capture-bin selection in ChooseTransition_* need true
+ *  particle numbers and keep using the stored bin means.
+ *
+ * Switch, overridable at configure time:
+ *   0 =^= previous behavior, bin-mean density used as the bin-center density (default)
+ *   1 =^= exponential bin-center density reconstruction
+ *
+ *   pic-configure -c "-DPARAM_OVERWRITES:LIST=\"-DPARAM_ATOMIC_PHYSICS_RATE_CENTER_DENSITY=1\"" ...
+ *
+ * @attention the unit-test reference values in debug/TestRateCalculation.hpp assume the
+ *  default (0); run RUN_UNIT_TESTS builds with the switch off.
+ */
+
+#ifndef PARAM_ATOMIC_PHYSICS_RATE_CENTER_DENSITY
+#    define PARAM_ATOMIC_PHYSICS_RATE_CENTER_DENSITY 0
+#endif
+
 namespace picongpu::particles::atomicPhysics::kernel
 {
+    static_assert(
+        PARAM_ATOMIC_PHYSICS_RATE_CENTER_DENSITY == 0 || PARAM_ATOMIC_PHYSICS_RATE_CENTER_DENSITY == 1,
+        "PARAM_ATOMIC_PHYSICS_RATE_CENTER_DENSITY must be 0 or 1");
+
+    //! compile-time switch, see file description
+    constexpr bool useCenterDensityReconstruction = (PARAM_ATOMIC_PHYSICS_RATE_CENTER_DENSITY != 0);
+
     template<uint32_t T_size>
     struct CachedHistogram
     {
         pmacc::memory::Array<float_X, T_size> energy;
         pmacc::memory::Array<float_X, T_size> binWidth;
+        //! bin-mean differential density, the physical electron content of the bin
         pmacc::memory::Array<float_X, T_size> density;
-
+        //! reconstructed bin-center differential density, used by the rate integration only
+        pmacc::memory::Array<float_X, T_size> rateDensity;
         static constexpr uint32_t size = T_size;
 
         constexpr uint32_t numBins() const
@@ -67,8 +116,61 @@ namespace picongpu::particles::atomicPhysics::kernel
                     binWidth[idx] = binWithValue;
                     // 1/(sim.unit.length()^3 * eV)
                     density[idx] = electronHistogram.getBinWeight0(idx) / volumeScalingFactor / binWithValue;
+
                 });
+            // the bin-center reconstruction reads the neighbouring bin, needs all means written
             worker.sync();
+
+            forEachElement([&](uint32_t const idx) { rateDensity[idx] = density[idx] * centerDensityFactor(idx); });
+            worker.sync();
+        }
+
+        /** exponential bin-center density reconstruction factor
+         *
+         * ratio of the bin-center density to the stored bin-mean density, see file
+         * description. Falls back to 1 (no correction) for the last bin, for empty bins
+         * and for a non-positive energy spacing.
+         *
+         * @param idx regular histogram-bin index
+         * @return unitless, in (0, 1]
+         */
+        HDINLINE float_X centerDensityFactor(uint32_t const idx) const
+        {
+            if constexpr(!useCenterDensityReconstruction)
+                return 1._X;
+            else
+            {
+                if(idx + 1u >= T_size)
+                    return 1._X;
+
+                float_X const densityThisBin = density[idx];
+                float_X const densityNextBin = density[idx + 1u];
+                // an empty bin gives no usable decay constant
+                if((densityThisBin <= 0._X) || (densityNextBin <= 0._X))
+                    return 1._X;
+
+                // eV
+                float_X const energyDifference = energy[idx + 1u] - energy[idx];
+                if(energyDifference <= 0._X)
+                    return 1._X;
+
+                /* limits the correction for sparsely populated bins, where the log-ratio of two
+                 * macro-particle estimates is dominated by sampling noise, to f >= 3/sinh(3) ~ 0.3 */
+                constexpr float_X maxHalfBinDecay = 3._X;
+
+                // 1/eV, local exponential decay constant of the electron spectrum
+                float_X const decayConstant = math::log(densityNextBin / densityThisBin) / energyDifference;
+                // unitless, half a bin measured in decay lengths
+                float_X const x = pmacc::math::max(
+                    -maxHalfBinDecay,
+                    pmacc::math::min(maxHalfBinDecay, decayConstant * binWidth[idx] / 2._X));
+
+                // x/sinh(x), series expansion near zero avoids the removable 0/0
+                if(x * x < 1.e-6_X)
+                    return 1._X - x * x / 6._X;
+
+                return 2._X * x / (math::exp(x) - math::exp(-x));
+            }
         }
 
         /** finite-difference density slope towards the next higher-energy bin
@@ -76,6 +178,10 @@ namespace picongpu::particles::atomicPhysics::kernel
          * Used by threshold-bin integration to reconstruct the electron density
          * at a sample shifted above the original bin center. The last bin has no
          * upper neighbour and therefore falls back to a constant density.
+         *
+         * @attention uses the reconstructed bin-center densities, so that a clip-shifted
+         *  sample composes correctly with the bin-center reconstruction. Identical to the
+         *  bin-mean slope when the reconstruction is switched off.
          *
          * @param idx regular histogram-bin index
          * @return density slope, [1/(sim.unit.length()^3 * eV^2)]
@@ -89,7 +195,7 @@ namespace picongpu::particles::atomicPhysics::kernel
             if(energyDifference <= 0._X)
                 return 0._X;
 
-            return (density[idx + 1u] - density[idx]) / energyDifference;
+            return (rateDensity[idx + 1u] - rateDensity[idx]) / energyDifference;
         }
 
         /** total electron number density of the histogram

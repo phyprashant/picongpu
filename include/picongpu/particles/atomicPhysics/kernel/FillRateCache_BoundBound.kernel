@@ -202,7 +202,7 @@ namespace picongpu::particles::atomicPhysics::kernel
 
                         auto const energy = cachedHistogram.energy[binIndex];
                         auto const binWidth = cachedHistogram.binWidth[binIndex];
-                        auto const density = cachedHistogram.density[binIndex];
+                        auto const density = cachedHistogram.rateDensity[binIndex];
                         auto const densitySlopeToNextBin = cachedHistogram.densitySlopeToNextBin(binIndex);
 
                         for(uint32_t transitionID = u32(0u); transitionID < numberTransitions; ++transitionID)

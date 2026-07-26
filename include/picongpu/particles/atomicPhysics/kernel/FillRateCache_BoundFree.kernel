@@ -141,7 +141,7 @@ namespace picongpu::particles::atomicPhysics::kernel
 
                     float_X const energy = cachedHistogram.energy[binIndex];
                     float_X const binWidth = cachedHistogram.binWidth[binIndex];
-                    float_X const density = cachedHistogram.density[binIndex];
+                    float_X const density = cachedHistogram.rateDensity[binIndex];
                     float_X const densitySlopeToNextBin = cachedHistogram.densitySlopeToNextBin(binIndex);
 
                     // eV

@@ -226,7 +226,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                                         T_BoundFreeTransitionDataBox>(
                                         cachedHistogram.energy[binIndex],
                                         cachedHistogram.binWidth[binIndex],
-                                        cachedHistogram.density[binIndex],
+                                        cachedHistogram.rateDensity[binIndex],
                                         cachedHistogram.densitySlopeToNextBin(binIndex),
                                         ionizationPotentialDepression,
                                         transitionCollectionIndex,

@@ -242,7 +242,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                             // test for each bin separately
                             for(uint32_t binIndex = 0; binIndex < T_Histogram::numberBins; ++binIndex)
                             {
-                                float_X const density = cachedHistogram.density[binIndex];
+                                float_X const density = cachedHistogram.rateDensity[binIndex];
                                 // 1/sim.unit.time()
                                 float_X const rateTransition = picongpu::particles::atomicPhysics::rateCalculation::
                                     BoundBoundTransitionRates<T_n_max>::template rateCollisionalBoundBoundTransition<
