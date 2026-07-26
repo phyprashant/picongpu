@@ -83,6 +83,12 @@ namespace picongpu::particles::atomicPhysics::kernel
         pmacc::memory::Array<float_X, T_size> density;
         //! reconstructed bin-center differential density, used by the rate integration only
         pmacc::memory::Array<float_X, T_size> rateDensity;
+        /** electron number density above the histogram range, [1/sim.unit.length()^3]
+         *
+         * the overflow bin stores the weight of all electrons with energy >= maxEnergy but not their energy,
+         *  it can therefore contribute to a number density but not to an energy average
+         */
+        float_X overflowDensity;
         static constexpr uint32_t size = T_size;
 
         constexpr uint32_t numBins() const
@@ -117,6 +123,10 @@ namespace picongpu::particles::atomicPhysics::kernel
                     // 1/(sim.unit.length()^3 * eV)
                     density[idx] = electronHistogram.getBinWeight0(idx) / volumeScalingFactor / binWithValue;
 
+                    // single writer, the overflow bin is a scalar and not part of the regular bin range
+                    if(idx == 0u)
+                        // 1/sim.unit.length()^3
+                        overflowDensity = electronHistogram.getOverflowWeight() / volumeScalingFactor;
                 });
             // the bin-center reconstruction reads the neighbouring bin, needs all means written
             worker.sync();
@@ -200,13 +210,14 @@ namespace picongpu::particles::atomicPhysics::kernel
 
         /** total electron number density of the histogram
          *
-         * @attention does not include the overflow bin
+         * includes the overflow bin, so that the three-body recombination detailed balance factor sees the
+         *  complete electron population acting as the third body
          *
          * @return unit: 1/sim.unit.length()^3
          */
         HDINLINE float_X electronDensity() const
         {
-            float_X result = 0._X;
+            float_X result = overflowDensity;
             for(uint32_t idx = 0u; idx < T_size; ++idx)
                 result += density[idx] * binWidth[idx];
             return result;
@@ -216,7 +227,9 @@ namespace picongpu::particles::atomicPhysics::kernel
          *
          * classical ideal gas estimator, T = 2/3 * <E_kin>, valid for non-relativistic electron spectra only
          *
-         * @attention does not include the overflow bin
+         * @attention does not include the overflow bin, which stores no energy information. A significant
+         *  overflow population therefore biases the estimate low, unlike electronDensity(), which does account
+         *  for it. Both are only meaningful for a spectrum that the histogram range actually resolves.
          *
          * @return unit: eV, 0 if histogram is empty
          */
