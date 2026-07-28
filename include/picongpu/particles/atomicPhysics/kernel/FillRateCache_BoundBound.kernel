@@ -26,6 +26,8 @@
 #include "picongpu/particles/atomicPhysics/electronDistribution/CachedHistogram.hpp"
 #include "picongpu/particles/atomicPhysics/enums/ChooseTransitionGroup.hpp"
 #include "picongpu/particles/atomicPhysics/enums/ProcessClassGroup.hpp"
+#include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/GetIPD.hpp"
+#include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/IsPressureIonized.hpp"
 #include "picongpu/particles/atomicPhysics/rateCalculation/BoundBoundTransitionRates.hpp"
 
 #include <pmacc/algorithms/math/PowerFunction.hpp>
@@ -57,8 +59,12 @@ namespace picongpu::particles::atomicPhysics::kernel
      * @tparam electronicDeexcitation is channel active?
      * @tparam spontaneousDeexcitation is channel active?
      * @tparam T_TransitionOrdering ordering of assumed for transition DataBox
+     *
+     * @tparam T_IPDModel ionization potential depression model, used to skip upward transitions into states
+     *  that no longer exist at the local plasma conditions, see upperStateIsPressureIonized()
      */
     template<
+        typename T_IPDModel,
         uint8_t T_numberLevels,
         uint32_t T_numberAtomicStates,
         uint32_t T_numberBins,
@@ -118,20 +124,26 @@ namespace picongpu::particles::atomicPhysics::kernel
             typename T_LocalTimeRemainingBox,
             typename T_LocalRateCacheBox,
             typename T_LocalElectronHistogramDataBox,
+            typename T_ChargeStateDataDataBox,
             typename T_AtomicStateDataDataBox,
+            typename T_IPDIonizationStateDataBox,
             typename T_AtomicStateStartIndexBox,
             typename T_AtomicStateNumberTransitionsBox,
-            typename T_BoundBoundTransitionDataBox>
+            typename T_BoundBoundTransitionDataBox,
+            typename... T_IPDInput>
         HDINLINE void operator()(
             T_Worker const& worker,
             T_AreaMapping const areaMapping,
             T_LocalTimeRemainingBox const timeRemainingBox,
             T_LocalRateCacheBox rateCacheBox,
             T_LocalElectronHistogramDataBox const electronHistogramDataBox,
+            T_ChargeStateDataDataBox const chargeStateDataDataBox,
             T_AtomicStateDataDataBox const atomicStateDataDataBox,
+            T_IPDIonizationStateDataBox const ipdIonizationStateDataBox,
             T_AtomicStateStartIndexBox const startIndexDataBox,
             T_AtomicStateNumberTransitionsBox const numberTransitionsDataBox,
-            T_BoundBoundTransitionDataBox const boundBoundTransitionDataBox) const
+            T_BoundBoundTransitionDataBox const boundBoundTransitionDataBox,
+            T_IPDInput... ipdInput) const
         {
             // check that correct databoxes are given
             PMACC_CASSERT(
@@ -159,6 +171,12 @@ namespace picongpu::particles::atomicPhysics::kernel
             auto& rateCache = rateCacheBox(superCellFieldIdx);
             auto& histogram = electronHistogramDataBox(superCellFieldIdx);
 
+            PMACC_SMEM(worker, superCellConstantIPDInput, typename T_IPDModel::SuperCellConstantInput);
+            auto onlyMaster = pmacc::lockstep::makeMaster(worker);
+            onlyMaster(
+                [&superCellConstantIPDInput, &superCellFieldIdx, &ipdInput...]()
+                { superCellConstantIPDInput = T_IPDModel::getSuperCellConstantInput(superCellFieldIdx, ipdInput...); });
+            worker.sync();
 
             // sim.unit.length()^3
             constexpr float_X volumeScalingFactor
@@ -173,10 +191,13 @@ namespace picongpu::particles::atomicPhysics::kernel
                     [&worker,
                      &rateCache,
                      &cachedHistogram,
+                     &chargeStateDataDataBox,
                      &atomicStateDataDataBox,
+                     &ipdIonizationStateDataBox,
                      &startIndexDataBox,
                      &numberTransitionsDataBox,
-                     &boundBoundTransitionDataBox](uint32_t const linearIdx)
+                     &boundBoundTransitionDataBox,
+                     &superCellConstantIPDInput](uint32_t const linearIdx)
                     {
                         uint32_t const binIndex = linearIdx / T_numberAtomicStates;
                         uint32_t const atomicStateCollectionIndex = linearIdx % T_numberAtomicStates;
@@ -205,9 +226,32 @@ namespace picongpu::particles::atomicPhysics::kernel
                         auto const density = cachedHistogram.rateDensity[binIndex];
                         auto const densitySlopeToNextBin = cachedHistogram.densitySlopeToNextBin(binIndex);
 
+                        // eV, bound-bound transitions do not change the charge state -> valid for both states
+                        [[maybe_unused]] float_X const ionizationPotentialDepression
+                            = ionizationPotentialDepression::template getIPD<T_IPDModel>(
+                                atomicStateDataDataBox,
+                                atomicStateCollectionIndex,
+                                superCellConstantIPDInput);
+
                         for(uint32_t transitionID = u32(0u); transitionID < numberTransitions; ++transitionID)
                         {
                             uint32_t const transitionCollectionIndex = offset + transitionID;
+
+                            /* excitation into a pressure-ionized state frees the same electron by the same
+                             *  collision that collisional ionization already counts against its IPD-shifted
+                             *  threshold, see upperStateIsPressureIonized() */
+                            if constexpr(isUpward)
+                            {
+                                if(ionizationPotentialDepression::upperStateIsPressureIonized(
+                                       transitionCollectionIndex,
+                                       ionizationPotentialDepression,
+                                       chargeStateDataDataBox,
+                                       atomicStateDataDataBox,
+                                       ipdIonizationStateDataBox,
+                                       boundBoundTransitionDataBox))
+                                    continue;
+                            }
+
                             float_X const transitionRate
                                 = picongpu::particles::atomicPhysics::rateCalculation::BoundBoundTransitionRates<
                                     T_numberLevels>::

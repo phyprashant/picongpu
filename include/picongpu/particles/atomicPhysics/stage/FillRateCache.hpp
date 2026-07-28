@@ -104,6 +104,7 @@ namespace picongpu::particles::atomicPhysics::stage
             if constexpr(AtomicDataType::switchElectronicExcitation)
             {
                 using FillRateCacheUpWardBoundBound = kernel::FillRateCacheKernel_BoundBound<
+                    IPDModel,
                     n_max,
                     numberAtomicStatesOfSpecies,
                     numberBins,
@@ -112,24 +113,28 @@ namespace picongpu::particles::atomicPhysics::stage
                     AtomicDataType::switchSpontaneousDeexcitation,
                     enums::TransitionOrdering::byLowerState>;
 
-                PMACC_LOCKSTEP_KERNEL(FillRateCacheUpWardBoundBound())
-                    .template config<IonSpecies::FrameType::frameSize>(mapper.getGridDim())(
-                        mapper,
-                        timeRemainingField->getDeviceDataBox(),
-                        rateCacheField->getDeviceDataBox(),
-                        electronHistogramField->getDeviceDataBox(),
-                        atomicData->template getAtomicStateDataDataBox<false>(),
-                        atomicData->template getBoundBoundStartIndexBlockDataBox<false>(),
-                        atomicData->template getBoundBoundNumberTransitionsDataBox<false>(),
-                        atomicData->template getBoundBoundTransitionDataBox<
-                            false,
-                            enums::TransitionOrdering::byLowerState>());
+                IPDModel::template callKernelWithIPDInput<
+                    FillRateCacheUpWardBoundBound,
+                    IonSpecies::FrameType::frameSize>(
+                    dc,
+                    mapper,
+                    timeRemainingField->getDeviceDataBox(),
+                    rateCacheField->getDeviceDataBox(),
+                    electronHistogramField->getDeviceDataBox(),
+                    atomicData->template getChargeStateDataDataBox<false>(),
+                    atomicData->template getAtomicStateDataDataBox<false>(),
+                    atomicData->template getIPDIonizationStateDataBox<false>(),
+                    atomicData->template getBoundBoundStartIndexBlockDataBox<false>(),
+                    atomicData->template getBoundBoundNumberTransitionsDataBox<false>(),
+                    atomicData
+                        ->template getBoundBoundTransitionDataBox<false, enums::TransitionOrdering::byLowerState>());
             }
 
             //    downward bound-bound transition rates
             if constexpr(AtomicDataType::switchElectronicDeexcitation || AtomicDataType::switchSpontaneousDeexcitation)
             {
                 using FillRateCacheDownWardBoundBound = kernel::FillRateCacheKernel_BoundBound<
+                    IPDModel,
                     n_max,
                     numberAtomicStatesOfSpecies,
                     numberBins,
@@ -138,18 +143,21 @@ namespace picongpu::particles::atomicPhysics::stage
                     AtomicDataType::switchSpontaneousDeexcitation,
                     enums::TransitionOrdering::byUpperState>;
 
-                PMACC_LOCKSTEP_KERNEL(FillRateCacheDownWardBoundBound())
-                    .template config<IonSpecies::FrameType::frameSize>(mapper.getGridDim())(
-                        mapper,
-                        timeRemainingField->getDeviceDataBox(),
-                        rateCacheField->getDeviceDataBox(),
-                        electronHistogramField->getDeviceDataBox(),
-                        atomicData->template getAtomicStateDataDataBox<false>(),
-                        atomicData->template getBoundBoundStartIndexBlockDataBox<false>(),
-                        atomicData->template getBoundBoundNumberTransitionsDataBox<false>(),
-                        atomicData->template getBoundBoundTransitionDataBox<
-                            false,
-                            enums::TransitionOrdering::byUpperState>());
+                IPDModel::template callKernelWithIPDInput<
+                    FillRateCacheDownWardBoundBound,
+                    IonSpecies::FrameType::frameSize>(
+                    dc,
+                    mapper,
+                    timeRemainingField->getDeviceDataBox(),
+                    rateCacheField->getDeviceDataBox(),
+                    electronHistogramField->getDeviceDataBox(),
+                    atomicData->template getChargeStateDataDataBox<false>(),
+                    atomicData->template getAtomicStateDataDataBox<false>(),
+                    atomicData->template getIPDIonizationStateDataBox<false>(),
+                    atomicData->template getBoundBoundStartIndexBlockDataBox<false>(),
+                    atomicData->template getBoundBoundNumberTransitionsDataBox<false>(),
+                    atomicData
+                        ->template getBoundBoundTransitionDataBox<false, enums::TransitionOrdering::byUpperState>());
             }
 
             //    upward bound-free transition rates, both collisional and field
