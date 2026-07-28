@@ -94,53 +94,65 @@ namespace picongpu::particles::atomicPhysics::stage
             // bound-bound(upward) transitions
             if constexpr(AtomicDataType::switchElectronicExcitation)
             {
-                PMACC_LOCKSTEP_KERNEL(
-                    picongpu::particles::atomicPhysics::kernel::ChooseTransitionKernel_BoundBound<
+                using ChooseTransitionKernel_BoundBoundUpward
+                    = picongpu::particles::atomicPhysics::kernel::ChooseTransitionKernel_BoundBound<
+                        IPDModel,
                         picongpu::atomicPhysics::ElectronHistogram,
                         AtomicDataType::ConfigNumber::numberLevels,
                         s_enums::TransitionDirection::upward,
                         AtomicDataType::switchElectronicExcitation,
                         AtomicDataType::switchElectronicDeexcitation,
-                        AtomicDataType::switchSpontaneousDeexcitation>())
-                    .config(mapper.getGridDim(), ions)(
-                        mapper,
-                        rngFactoryFloat,
-                        atomicData.template getAtomicStateDataDataBox<false>(),
-                        atomicData.template getBoundBoundNumberTransitionsDataBox<false>(),
-                        atomicData.template getBoundBoundStartIndexBlockDataBox<false>(),
-                        atomicData.template getBoundBoundTransitionDataBox<
-                            false,
-                            s_enums::TransitionOrdering::byLowerState>(),
-                        timeRemainingField.getDeviceDataBox(),
-                        electronHistogramField.getDeviceDataBox(),
-                        rateCacheField.getDeviceDataBox(),
-                        ions.getDeviceParticlesBox());
+                        AtomicDataType::switchSpontaneousDeexcitation>;
+
+                IPDModel::template callKernelWithIPDInput<
+                    ChooseTransitionKernel_BoundBoundUpward,
+                    IonSpecies::FrameType::frameSize>(
+                    dc,
+                    mapper,
+                    rngFactoryFloat,
+                    atomicData.template getChargeStateDataDataBox<false>(),
+                    atomicData.template getAtomicStateDataDataBox<false>(),
+                    atomicData.template getIPDIonizationStateDataBox<false>(),
+                    atomicData.template getBoundBoundNumberTransitionsDataBox<false>(),
+                    atomicData.template getBoundBoundStartIndexBlockDataBox<false>(),
+                    atomicData
+                        .template getBoundBoundTransitionDataBox<false, s_enums::TransitionOrdering::byLowerState>(),
+                    timeRemainingField.getDeviceDataBox(),
+                    electronHistogramField.getDeviceDataBox(),
+                    rateCacheField.getDeviceDataBox(),
+                    ions.getDeviceParticlesBox());
             }
 
             // bound-bound(downward) transitions
             if constexpr(AtomicDataType::switchElectronicDeexcitation || AtomicDataType::switchSpontaneousDeexcitation)
             {
-                PMACC_LOCKSTEP_KERNEL(
-                    picongpu::particles::atomicPhysics::kernel::ChooseTransitionKernel_BoundBound<
+                using ChooseTransitionKernel_BoundBoundDownward
+                    = picongpu::particles::atomicPhysics::kernel::ChooseTransitionKernel_BoundBound<
+                        IPDModel,
                         picongpu::atomicPhysics::ElectronHistogram,
                         AtomicDataType::ConfigNumber::numberLevels,
                         s_enums::TransitionDirection::downward,
                         AtomicDataType::switchElectronicExcitation,
                         AtomicDataType::switchElectronicDeexcitation,
-                        AtomicDataType::switchSpontaneousDeexcitation>())
-                    .config(mapper.getGridDim(), ions)(
-                        mapper,
-                        rngFactoryFloat,
-                        atomicData.template getAtomicStateDataDataBox<false>(),
-                        atomicData.template getBoundBoundNumberTransitionsDataBox<false>(),
-                        atomicData.template getBoundBoundStartIndexBlockDataBox<false>(),
-                        atomicData.template getBoundBoundTransitionDataBox<
-                            false,
-                            s_enums::TransitionOrdering::byUpperState>(),
-                        timeRemainingField.getDeviceDataBox(),
-                        electronHistogramField.getDeviceDataBox(),
-                        rateCacheField.getDeviceDataBox(),
-                        ions.getDeviceParticlesBox());
+                        AtomicDataType::switchSpontaneousDeexcitation>;
+
+                IPDModel::template callKernelWithIPDInput<
+                    ChooseTransitionKernel_BoundBoundDownward,
+                    IonSpecies::FrameType::frameSize>(
+                    dc,
+                    mapper,
+                    rngFactoryFloat,
+                    atomicData.template getChargeStateDataDataBox<false>(),
+                    atomicData.template getAtomicStateDataDataBox<false>(),
+                    atomicData.template getIPDIonizationStateDataBox<false>(),
+                    atomicData.template getBoundBoundNumberTransitionsDataBox<false>(),
+                    atomicData.template getBoundBoundStartIndexBlockDataBox<false>(),
+                    atomicData
+                        .template getBoundBoundTransitionDataBox<false, s_enums::TransitionOrdering::byUpperState>(),
+                    timeRemainingField.getDeviceDataBox(),
+                    electronHistogramField.getDeviceDataBox(),
+                    rateCacheField.getDeviceDataBox(),
+                    ions.getDeviceParticlesBox());
             }
 
             // bound-free(upward) collisional transitions

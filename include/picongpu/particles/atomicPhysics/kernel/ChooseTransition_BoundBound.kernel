@@ -30,9 +30,12 @@
 #include "picongpu/particles/atomicPhysics/enums/TransitionDirection.hpp"
 #include "picongpu/particles/atomicPhysics/enums/TransitionOrderingFor.hpp"
 #include "picongpu/particles/atomicPhysics/enums/TransitionType.hpp"
+#include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/GetIPD.hpp"
+#include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/IsPressureIonized.hpp"
 #include "picongpu/particles/atomicPhysics/rateCalculation/BoundBoundTransitionRates.hpp"
 
 #include <pmacc/attribute/FunctionSpecifier.hpp>
+#include <pmacc/lockstep/ForEach.hpp>
 #include <pmacc/memory/shared/Allocate.hpp>
 #include <pmacc/particles/algorithm/ForEach.hpp>
 #include <pmacc/static_assert.hpp>
@@ -55,8 +58,12 @@ namespace picongpu::particles::atomicPhysics::kernel
      * @tparam electronicExcitation is channel active?
      * @tparam electronicDeexcitation is channel active?
      * @tparam spontaneousDeexcitation is channel active?
+     *
+     * @tparam T_IPDModel ionization potential depression model, must match FillRateCache_BoundBound so that the
+     *  transitions summed here are exactly the ones the rate cache was filled from
      */
     template<
+        typename T_IPDModel,
         typename T_Histogram,
         uint8_t T_n_max,
         s_enums::TransitionDirection T_TransitionDirection,
@@ -124,26 +131,32 @@ namespace picongpu::particles::atomicPhysics::kernel
             typename T_Worker,
             typename T_AreaMapping,
             typename T_RngGeneratorFactoryFloat,
+            typename T_ChargeStateDataDataBox,
             typename T_AtomicStateDataDataBox,
+            typename T_IPDIonizationStateDataBox,
             typename T_AtomicStateBoundBoundNumberTransitionsDataBox,
             typename T_AtomicStateBoundBoundStartIndexBlockDataBox,
             typename T_BoundBoundTransitionDataBox,
             typename T_LocalTimeRemainingBox,
             typename T_LocalElectronHistogramDataBox,
             typename T_LocalRateCacheBox,
-            typename T_IonBox>
+            typename T_IonBox,
+            typename... T_IPDInput>
         HDINLINE void operator()(
             T_Worker const& worker,
             T_AreaMapping const areaMapping,
             T_RngGeneratorFactoryFloat rngFactoryFloat,
+            T_ChargeStateDataDataBox const chargeStateDataDataBox,
             T_AtomicStateDataDataBox const atomicStateDataDataBox,
+            T_IPDIonizationStateDataBox const ipdIonizationStateDataBox,
             T_AtomicStateBoundBoundNumberTransitionsDataBox const numberTransitionsBox,
             T_AtomicStateBoundBoundStartIndexBlockDataBox const startIndexBox,
             T_BoundBoundTransitionDataBox const transitionDataBox,
             T_LocalTimeRemainingBox const timeRemainingBox,
             T_LocalElectronHistogramDataBox electronHistogramDataBox,
             T_LocalRateCacheBox rateCacheBox,
-            T_IonBox ionBox) const
+            T_IonBox ionBox,
+            T_IPDInput... ipdInput) const
         {
             // check that correct databoxes are given
             PMACC_CASSERT(
@@ -169,6 +182,13 @@ namespace picongpu::particles::atomicPhysics::kernel
             auto& rateCache = rateCacheBox(superCellFieldIdx);
             T_Histogram& electronHistogram = electronHistogramDataBox(superCellFieldIdx);
 
+            PMACC_SMEM(worker, superCellConstantIPDInput, typename T_IPDModel::SuperCellConstantInput);
+            auto onlyMaster = pmacc::lockstep::makeMaster(worker);
+            onlyMaster(
+                [&superCellConstantIPDInput, &superCellFieldIdx, &ipdInput...]()
+                { superCellConstantIPDInput = T_IPDModel::getSuperCellConstantInput(superCellFieldIdx, ipdInput...); });
+            worker.sync();
+
             // sim.unit.length()^3
             constexpr float_X volumeScalingFactor
                 = pmacc::math::CT::volume<SuperCellSize>::type::value * sim.pic.getCellSize().productOfComponents();
@@ -185,12 +205,15 @@ namespace picongpu::particles::atomicPhysics::kernel
             //      roll specific transition and bin
             forEachLocalIonBoxEntry(
                 [&rngGeneratorFloat,
+                 &chargeStateDataDataBox,
                  &atomicStateDataDataBox,
+                 &ipdIonizationStateDataBox,
                  &numberTransitionsBox,
                  &startIndexBox,
                  &transitionDataBox,
                  &cachedHistogram,
-                 &rateCache](T_Worker const& worker, auto& ion)
+                 &rateCache,
+                 &superCellConstantIPDInput](T_Worker const& worker, auto& ion)
                 {
                     // debug
                     checkForInvalidChooseTransitionGroup(ion);
@@ -230,11 +253,38 @@ namespace picongpu::particles::atomicPhysics::kernel
                         return;
                     }
 
+                    // eV, bound-bound transitions do not change the charge state -> valid for both states
+                    [[maybe_unused]] float_X const ionizationPotentialDepression
+                        = ionizationPotentialDepression::template getIPD<T_IPDModel>(
+                            atomicStateDataDataBox,
+                            atomicStateCollectionIndex,
+                            superCellConstantIPDInput);
+
+                    /* last transition not suppressed below, i.e. the one the last resort must fall back to;
+                     *  the transition block is never empty here since stateTotalLossRate > 0 */
+                    uint32_t lastAllowedTransitionID = 0u;
+
                     // compare to cumulative sum of normalized transition rates to find choosen transition
                     float_X cumSum = 0._X;
                     for(uint32_t transitionID = 0u; transitionID < numberTransitions; ++transitionID)
                     {
                         /// @todo cache transitionData, Brian Marre, 2023
+
+                        /* skip transitions FillRateCache_BoundBound left out of the cached sum this cumulative
+                         *  sum is normalized by, see upperStateIsPressureIonized() */
+                        if constexpr(isUpward)
+                        {
+                            if(ionizationPotentialDepression::upperStateIsPressureIonized(
+                                   transitionID + startIndexTransitionBlock,
+                                   ionizationPotentialDepression,
+                                   chargeStateDataDataBox,
+                                   atomicStateDataDataBox,
+                                   ipdIonizationStateDataBox,
+                                   transitionDataBox))
+                                continue;
+
+                            lastAllowedTransitionID = transitionID;
+                        }
 
                         // collisional de-/excitation
                         if constexpr(electronicChannelActive)
@@ -346,12 +396,17 @@ namespace picongpu::particles::atomicPhysics::kernel
                     // select last resort, choose last possible transition
                     if constexpr(isUpward || !T_spontaneousDeexcitation)
                     {
+                        /* upward: the last transition may have been suppressed as pressure-ionized, which would
+                         *  put the ion into a state the rate cache never accounted for */
+                        uint32_t const lastResortTransitionID
+                            = isUpward ? lastAllowedTransitionID : (numberTransitions - 1u);
+
                         // was electronic collisional transition
                         updateIon(
                             ion,
                             s_enums::LastResort<chooseTransitionGroup>::template processClass<
                                 T_spontaneousDeexcitation>(),
-                            startIndexTransitionBlock + numberTransitions - 1u,
+                            startIndexTransitionBlock + lastResortTransitionID,
                             T_Histogram::numberBins - 1u);
                     }
                     else
