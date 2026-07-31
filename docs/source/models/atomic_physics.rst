@@ -3,7 +3,7 @@
 Atomic Physics/FLYonPIC
 ======================
 
-.. moduleauthor:: Brian Marre
+.. moduleauthor:: Brian Marre, Prashant Sharma
 
 Introduction
 ------------
@@ -30,7 +30,7 @@ FLYonPIC is based on the [FlyCHK]_ atomic model and currently implements the fol
 - pressure ionization (according to Stewart-Pyatt ionization potential depression)
 - field ionization [BSI + ADK] (with Stewart-Pyatt ionization potential depression)
 - three body electronic recombination (Maxwellian detailed balance inverse of electron impact ionization, with Stewart-Pyatt ionization potential depression)
-- spontaneous radiative recombination (Milne relation applied to the bound-free photoionization cross-section fit of the atomic input data, with a hydrogenic Kramers fallback, evaluated on the binned electron spectrum, with Stewart-Pyatt ionization potential depression)
+- radiative-recombination (Milne relation applied to the bound-free photoionization cross-section fit of the atomic input data, with a hydrogenic Kramers fallback, evaluated on the binned electron spectrum, with Stewart-Pyatt ionization potential depression)
 
 .. attention::
 
@@ -40,7 +40,7 @@ FLYonPIC is based on the [FlyCHK]_ atomic model and currently implements the fol
 
 .. attention::
 
-   Radiative recombination is spontaneous only, stimulated recombination and photoionization require a radiation field model and are not implemented yet.
+   Radiative-recombination is spontaneous only, stimulated recombination and photoionization require a radiation field model and are not implemented yet.
    The emitted photon is not tracked: its energy, the captured electron's kinetic energy plus the released binding energy, leaves the simulation.
    This optically thin photon-escape closure can be a poor approximation for dense or extended laser-driven plasmas, where recombination continuum photons may be reabsorbed or drive photoionization elsewhere; it is a first radiation closure, not radiation-transport-coupled recombination.
    The captured electron weight is removed by the same statistical per-histogram-bin mean-field reweighting as for three body recombination.

@@ -2,8 +2,8 @@
 """
 atomicPhysics(FLYonPIC) reference rate calculation
 This file is part of the PIConGPU.
-Copyright 2023-2024 PIConGPU contributors
-Authors: Brian Marre
+Copyright 2023-2026 PIConGPU contributors
+Authors: Brian Marre, Prashant Sharma
 License: GPLv3+
 """
 

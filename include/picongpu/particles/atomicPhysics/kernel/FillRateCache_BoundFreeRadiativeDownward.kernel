@@ -43,7 +43,7 @@ namespace picongpu::particles::atomicPhysics::kernel
     /** fill rate cache kernel for downward radiative bound-free transitions
      *
      * add for all atomic states and all bins the rate of each downward radiative bound-free transition, i.e.
-     *  spontaneous radiative recombination, to the rate cache slot of the atomic state.
+     *  radiative-recombination, to the rate cache slot of the atomic state.
      *
      * called by fillRateCache atomicPhysics sub-stage
      *

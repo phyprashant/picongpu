@@ -1,4 +1,4 @@
-/* Copyright 2023-2026 Brian Marre, Prashant Sharma
+/* Copyright 2023-2026 Prashant Sharma
  *
  * This file is part of PIConGPU.
  *
@@ -32,12 +32,12 @@
 
 /** @file implements calculation of rates for radiative bound-free atomic physics transitions
  *
- * this includes spontaneous radiative recombination:
+ * this includes radiative-recombination:
  *  upperState + free electron -> lowerState + photon
  * @todo photoionization from a radiation field, requires a radiation field model, Prashant Sharma, 2026
  * @todo stimulated recombination, requires a radiation field model, Prashant Sharma, 2026
  *
- * The radiative recombination cross section is obtained from the photoionization cross section of the same
+ * The radiative-recombination cross section is obtained from the photoionization cross section of the same
  *  bound-free transition via the Milne(detailed balance) relation and integrated over the local electron
  *  histogram, following the SCFLY/FLYCHK conventions.
  *
@@ -69,7 +69,7 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
          *
          * sigma_RR(E_e) = milneConstant * g_lower/g_upper * E_gamma^2 / E_e * sigma_PI(E_gamma)
          *
-         * derived from SCFLY's spontaneous recombination integral such that the Maxwellian average of sigma_RR
+         * derived from SCFLY's recombination integral such that the Maxwellian average of sigma_RR
          *  reproduces it exactly:
          *  milneConstant = 1.656415e-22[cm^3] * 2.4179e14[Hz/eV] * 1.636e9 / (2/sqrt(pi) * sqrt(2 * e/m_e)[cm/s])
          * numerically equal to the textbook Milne factor 1/(2 * m_e c^2) within 0.06%, the electron spin factor 2
@@ -210,7 +210,7 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
                 static_cast<float_64>(boundFreeTransitionDataBox.multiplicity(transitionCollectionIndex)));
         }
 
-        /** spontaneous radiative recombination cross section of a bound-free transition
+        /** Radiative-recombination cross section of a bound-free transition
          *
          * Milne(detailed balance) relation applied to the photoionization cross section of the same transition,
          *  sigma_RR(E_e) = milneConstant * g_lower/g_upper * E_gamma^2 / E_e * sigma_PI(E_gamma),
@@ -276,7 +276,7 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
                 static_cast<float_64>(std::numeric_limits<float_X>::max())));
         }
 
-        /** rate of spontaneous radiative recombination for a bound-free transition and a free electron bin
+        /** Rate of radiative-recombination for a bound-free transition and a free electron bin
          *
          * uses second order integration(bin middle)
          *
@@ -307,7 +307,7 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
             T_BoundFreeTransitionDataBox const boundFreeTransitionDataBox)
         {
 #if defined(PARAM_SUPPRESS_RECOMB_ABOVE_NMAX) && (PARAM_SUPPRESS_RECOMB_ABOVE_NMAX > 0)
-            // momentary diagnostic: suppress radiative recombination into high-n Rydberg
+            // momentary diagnostic: suppress radiative-recombination into high-n Rydberg
             // states (highest occupied shell >= PARAM_SUPPRESS_RECOMB_ABOVE_NMAX) whose rate
             // coefficients are over-predicted vs native SCFLY. Photoionization is left untouched.
             {

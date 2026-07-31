@@ -1,4 +1,4 @@
-/* Copyright 2025 Brian Marre
+/* Copyright 2025-2026 Brian Marre, Prashant Sharma
  *
  * This file is part of PIConGPU.
  *

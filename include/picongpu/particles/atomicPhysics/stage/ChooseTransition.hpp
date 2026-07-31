@@ -1,4 +1,4 @@
-/* Copyright 2023-2024 Brian Marre
+/* Copyright 2023-2026 Brian Marre, Prashant Sharma
  *
  * This file is part of PIConGPU.
  *
@@ -209,7 +209,7 @@ namespace picongpu::particles::atomicPhysics::stage
                     ions.getDeviceParticlesBox());
             }
 
-            // bound-free(downward) radiative transitions, i.e. spontaneous radiative recombination
+            // bound-free(downward) radiative transitions, i.e. radiative-recombination
             if constexpr(AtomicDataType::switchRadiativeRecombination)
             {
                 using ChooseTransitionKernel_RadiativeBoundFreeDownward = picongpu::particles::atomicPhysics::

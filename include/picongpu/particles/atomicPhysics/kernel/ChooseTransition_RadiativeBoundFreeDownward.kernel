@@ -43,7 +43,7 @@ namespace picongpu::particles::atomicPhysics::kernel
     namespace s_enums = picongpu::particles::atomicPhysics::enums;
 
     /** choose specific transition from previously selected transitionType for downward radiative bound-free
-     *  transitions, i.e. spontaneous radiative recombination
+     *  transitions, i.e. radiative-recombination
      *
      * A transition and the captured electron's histogram bin are selected jointly by rolling a random number r,
      *  [0,1) and comparing it to the cumulative sums of the normalized per (transition, bin) rates of the

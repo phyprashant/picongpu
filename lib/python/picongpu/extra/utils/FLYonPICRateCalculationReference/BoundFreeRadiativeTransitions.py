@@ -13,7 +13,7 @@ import scipy.special as scipy
 
 """ @file reference implementation of the rate calculation for bound-free radiative transitions
 
-Spontaneous radiative recombination: upperState + free electron -> lowerState + photon
+Radiative-recombination: upperState + free electron -> lowerState + photon
 
 The recombination cross section is the Milne(detailed balance) relation applied to the photoionization
 cross section of the same bound-free transition, following the SCFLY/FLYCHK conventions.
@@ -25,7 +25,7 @@ reproduces SCFLY's hydrogenic recombination rate coefficient "alfxx" exactly.
 # cm/(s*eV^0.5), Maxwellian f(E)*v(E) coefficient, v = sqrt(2E/m_e) nonrelativistic
 _F_V = 2.0 / np.sqrt(np.pi) * np.sqrt(2.0 * const.elementary_charge / const.electron_mass) * 100.0
 
-# 1/eV, Milne relation prefactor, from the SCFLY spontaneous recombination constants,
+# 1/eV, Milne relation prefactor, from the SCFLY recombination constants,
 #  numerically equal to the textbook 1/(2 m_e c^2) within 0.06%
 MILNE_CONSTANT = 1.656415e-22 * 2.4179e14 * 1.636e9 / _F_V
 
@@ -131,7 +131,7 @@ class BoundFreeRadiativeTransitions:
         cxin6,
         cxin8,
     ):
-        """spontaneous radiative recombination cross section via the Milne relation
+        """Radiative-recombination cross section via the Milne relation
 
         sigma_RR(E_e) = MILNE_CONSTANT * g_lower/g_upper * E_gamma^2/E_e * sigma_PI(E_gamma),
         E_gamma = E_e + deltaEnergyTransition
@@ -189,7 +189,7 @@ class BoundFreeRadiativeTransitions:
         cxin6,
         cxin8,
     ):
-        """rate of spontaneous radiative recombination for one free electron bin
+        """Rate of radiative-recombination for one free electron bin
 
         @param energyElectron float central energy of electron bin, [eV]
         @param energyElectronBinWidth float width of energy bin, [eV]

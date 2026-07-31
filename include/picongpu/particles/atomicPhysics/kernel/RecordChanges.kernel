@@ -1,4 +1,4 @@
-/* Copyright 2023-2024 Brian Marre
+/* Copyright 2023-2026 Brian Marre, Prashant Sharma
  *
  * This file is part of PIConGPU.
  *
@@ -367,9 +367,9 @@ namespace picongpu::particles::atomicPhysics::kernel
         }
     };
 
-    /** specialization for spontaneous radiative recombination
+    /** specialization for radiative-recombination
      *
-     * Radiative recombination captures a free electron and emits a photon carrying the captured electron's kinetic
+     * Radiative-recombination captures a free electron and emits a photon carrying the captured electron's kinetic
      *  energy plus the released binding energy. The emitted photon is not tracked(optically thin approximation),
      *  therefore no energy is recorded to the electron histogram, the captured electron's energy leaves the
      *  simulation with its weight in the electron capture sub-stage.

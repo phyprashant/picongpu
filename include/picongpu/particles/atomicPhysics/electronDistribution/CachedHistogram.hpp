@@ -1,4 +1,4 @@
-/* Copyright 2023-2024 Rene Widera
+/* Copyright 2023-2026 Rene Widera, Prashant Sharma
  *
  * This file is part of PIConGPU.
  *
@@ -169,7 +169,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                 constexpr float_X maxHalfBinDecay = 3._X;
 
                 // 1/eV, local exponential decay constant of the electron spectrum
-                float_X const decayConstant = math::log(densityNextBin / densityThisBin) / energyDifference;
+                float_X const decayConstant = pmacc::math::log(densityNextBin / densityThisBin) / energyDifference;
                 // unitless, half a bin measured in decay lengths
                 float_X const x = pmacc::math::max(
                     -maxHalfBinDecay,
@@ -179,7 +179,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                 if(x * x < 1.e-6_X)
                     return 1._X - x * x / 6._X;
 
-                return 2._X * x / (math::exp(x) - math::exp(-x));
+                return 2._X * x / (pmacc::math::exp(x) - pmacc::math::exp(-x));
             }
         }
 

@@ -1,4 +1,4 @@
-/* Copyright 2023-2024 Brian Marre
+/* Copyright 2023-2026 Brian Marre, Prashant Sharma
  *
  * This file is part of PIConGPU.
  *
@@ -219,7 +219,7 @@ namespace picongpu::particles::atomicPhysics::stage
                         ->template getBoundFreeTransitionDataBox<false, enums::TransitionOrdering::byUpperState>());
             }
 
-            //    downward radiative bound-free transition rates, i.e. spontaneous radiative recombination
+            //    downward radiative bound-free transition rates, i.e. radiative-recombination
             if constexpr(AtomicDataType::switchRadiativeRecombination)
             {
                 using FillRateCacheRadiativeDownWardBoundFree = kernel::FillRateCacheKernel_BoundFreeRadiativeDownward<

@@ -61,7 +61,7 @@ namespace picongpu::particles::atomicPhysics::atomicData
      * @tparam T_fieldIonization is channel active?
      * @tparam T_threeBodyRecombination is channel active? requires T_electronicIonization,
      *  since its rate is the detailed balance inverse of the electronic ionization rate
-     * @tparam T_radiativeRecombination is channel active? spontaneous radiative recombination only,
+     * @tparam T_radiativeRecombination is channel active? spontaneous radiative-recombination only,
      *  emitted photon energy is not tracked(optically thin approximation)
      *
      * The atomicPhysics step relies on a model of atomic states and transitions for each

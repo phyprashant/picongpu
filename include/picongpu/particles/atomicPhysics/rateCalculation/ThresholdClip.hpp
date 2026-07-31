@@ -19,11 +19,10 @@
 
 /** @file threshold-clipped bin integration for collisional rate calculation
  *
- * The electron histogram bins are wide compared to sharp transition thresholds
- * (log-spaced bins are ~60 eV wide near a 500 eV threshold). The default rate
- * integration samples the cross section once at the bin center over the full bin
- * width. For the single bin straddling a transition threshold deltaE this is wrong
- * in one of two ways:
+ * The electron histogram bins are wide compared to sharp transition thresholds.
+ * The default rate integration samples the cross section once at the bin center
+ * over the full bin width. For the single bin straddling a transition threshold
+ * deltaE this is wrong in one of two ways:
  *  - bin center below deltaE: the entire bin contributes zero, although the
  *    sub-interval [deltaE, binMax) is above threshold, or
  *  - bin center above deltaE: the entire bin width contributes, although the
@@ -45,16 +44,16 @@
  *
  *   pic-configure -c "-DPARAM_OVERWRITES:LIST=\"-DPARAM_ATOMIC_PHYSICS_RATE_THRESHOLD_CLIP=2\"" ...
  *
- * @attention the unit-test reference values in debug/TestRateCalculation.hpp and the
- *  python reference module assume the default (0); run RUN_UNIT_TESTS builds with the
- *  switch off.
- * @attention applied inside the shared rate functions, therefore consistently used by
- *  both the FillRateCache_* and ChooseTransition_* kernels and by the 3BR EII bin sum.
- * @attention with the clip enabled, the threshold-straddling bin can be selected for a
- *  transition although its bin-center energy lies below deltaE. The bin-mean energy
- *  bookkeeping in DecelerateElectrons may then drive the per-electron energy slightly
- *  negative (bounded by half a bin width per event); this is handled by the existing
- *  newEnergyElectron < 0 clamp in DecelerateElectrons.kernel.
+ * @attention build unit tests with the switch off, the reference values in
+ *  debug/TestRateCalculation.hpp were generated with the default (0).
+ * @attention the clip sits in the shared rate functions, so FillRateCache_*,
+ *  ChooseTransition_* and the 3BR EII bin sum all see the same rates. They must
+ *  agree, otherwise transition sampling is biased.
+ * @attention with the clip on, a bin whose center lies below deltaE may be chosen.
+ *  DecelerateElectrons then subtracts deltaE from that (smaller) bin-center energy
+ *  and the result can go slightly negative, at most half a bin width per event.
+ *  The existing newEnergyElectron < 0 clamp in DecelerateElectrons.kernel catches
+ *  this, at the price of dropping that small energy deficit.
  */
 
 #pragma once
