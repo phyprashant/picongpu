@@ -65,6 +65,20 @@ namespace picongpu::atomicPhysics
          * subs-steps than set here.
          */
         static constexpr uint32_t maximumNumberSubStepsPerPICTimeStep = 200u;
+
+#ifndef PARAM_CAP_COLLISIONAL_BOUND_FREE_PAIR_RATES
+/* proportional capping of collisional bound-free rates above the instant transition rate
+ * limit; set 0 for an uncapped comparison run */
+#    define PARAM_CAP_COLLISIONAL_BOUND_FREE_PAIR_RATES 1
+#endif
+        /** bound the collisional bound-free contribution to a state's loss rate by the instant transition limit
+         *
+         * see particles/atomicPhysics/CollisionalBoundFreePairCap.hpp; scales collisional ionization and its
+         *  detailed balance inverse, three-body recombination, by a common per transition factor, leaving the
+         *  equilibrium of the collisional bound-free sub-network exact and only stretching its transient
+         */
+        static constexpr bool capCollisionalBoundFreePairRates
+            = (PARAM_CAP_COLLISIONAL_BOUND_FREE_PAIR_RATES != 0);
     };
 
     /** atomicConfigNumber definition for argon ions

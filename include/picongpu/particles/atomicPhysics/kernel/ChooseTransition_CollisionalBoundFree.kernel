@@ -21,6 +21,7 @@
 
 #include "picongpu/defines.hpp"
 #include "picongpu/particles/atomicPhysics/CheckForInvalidChooseTransitionGroup.hpp"
+#include "picongpu/particles/atomicPhysics/CollisionalBoundFreePairCap.hpp"
 #include "picongpu/particles/atomicPhysics/ConvertEnum.hpp"
 #include "picongpu/particles/atomicPhysics/electronDistribution/CachedHistogram.hpp"
 #include "picongpu/particles/atomicPhysics/enums/ChooseTransitionGroup.hpp"
@@ -225,29 +226,45 @@ namespace picongpu::particles::atomicPhysics::kernel
                             atomicStateCollectionIndex,
                             superCellConstantIPDInput);
 
+                    /* did any state of this superCell have its collisional bound-free rates capped? false in the
+                     *  regular case of a fully resolvable collisional bound-free sub-network */
+                    bool const capActive = CollisionalBoundFreePairCap::enabled
+                        && rateCache.anyCollisionalBoundFreeCapped();
+
                     float_X cumSum = 0._X;
                     for(uint32_t transitionID = 0u; transitionID < numberTransitions; ++transitionID)
                     {
                         uint32_t const transitionIndex = transitionID + startIndexTransitionBlock;
 
+                        /* must repeat the capping of the capCollisionalBoundFreeRates sub-stage, stateTotalLossrate
+                         *  we normalize against already holds the capped rates
+                         * unitless, in (0, 1] */
+                        float_X const pairScaling = capActive
+                            ? CollisionalBoundFreePairCap::transitionScalingFactor(
+                                  rateCache,
+                                  atomicStateCollectionIndex,
+                                  transitionDataBox.upperStateCollectionIndex(transitionIndex))
+                            : 1._X;
+
                         for(uint32_t binIndex = 0u; binIndex < numberBins; ++binIndex)
                         {
                             // 1/sim.unit.time()
-                            float_X const rateTransition = picongpu::particles::atomicPhysics::rateCalculation::
-                                BoundFreeCollisionalTransitionRates<T_n_max>::
-                                    template rateCollisionalIonizationTransition<
-                                        T_ChargeStateDataDataBox,
-                                        T_AtomicStateDataDataBox,
-                                        T_BoundFreeTransitionDataBox>(
-                                        cachedHistogram.energy[binIndex],
-                                        cachedHistogram.binWidth[binIndex],
-                                        cachedHistogram.rateDensity[binIndex],
-                                        cachedHistogram.densitySlopeToNextBin(binIndex),
-                                        ionizationPotentialDepression,
-                                        transitionIndex,
-                                        chargeStateDataDataBox,
-                                        atomicStateDataDataBox,
-                                        transitionDataBox);
+                            float_X const rateTransition = pairScaling
+                                * picongpu::particles::atomicPhysics::rateCalculation::
+                                    BoundFreeCollisionalTransitionRates<T_n_max>::
+                                        template rateCollisionalIonizationTransition<
+                                            T_ChargeStateDataDataBox,
+                                            T_AtomicStateDataDataBox,
+                                            T_BoundFreeTransitionDataBox>(
+                                            cachedHistogram.energy[binIndex],
+                                            cachedHistogram.binWidth[binIndex],
+                                            cachedHistogram.rateDensity[binIndex],
+                                            cachedHistogram.densitySlopeToNextBin(binIndex),
+                                            ionizationPotentialDepression,
+                                            transitionIndex,
+                                            chargeStateDataDataBox,
+                                            atomicStateDataDataBox,
+                                            transitionDataBox);
 
                             cumSum += rateTransition / stateTotalLossrate;
 

@@ -32,6 +32,7 @@
 #include "picongpu/particles/atomicPhysics/stage/ApplyElectronCapture.hpp"
 #include "picongpu/particles/atomicPhysics/stage/BinElectrons.hpp"
 #include "picongpu/particles/atomicPhysics/stage/CalculateStepLength.hpp"
+#include "picongpu/particles/atomicPhysics/stage/CapCollisionalBoundFreeRates.hpp"
 #include "picongpu/particles/atomicPhysics/stage/CheckForFieldEnergyOverSubscription.hpp"
 #include "picongpu/particles/atomicPhysics/stage/CheckForOverSubscription.hpp"
 #include "picongpu/particles/atomicPhysics/stage/CheckPresence.hpp"
@@ -361,6 +362,14 @@ namespace picongpu::simulation::stage
                 using ForEachIonSpeciesFillRateCache = pmacc::meta::
                     ForEach<AtomicPhysicsIonSpecies, particles::atomicPhysics::stage::FillRateCache<boost::mpl::_1>>;
                 ForEachIonSpeciesFillRateCache{}(mappingDesc);
+
+                /* bound the collisional bound-free contribution to each state's loss rate, without changing the
+                 *  equilibrium of the collisional bound-free sub-network, see CollisionalBoundFreePairCap
+                 * @attention must run on the un-capped rates, i.e. directly after the fill */
+                using ForEachIonSpeciesCapCollisionalBoundFreeRates = pmacc::meta::ForEach<
+                    AtomicPhysicsIonSpecies,
+                    particles::atomicPhysics::stage::CapCollisionalBoundFreeRates<boost::mpl::_1>>;
+                ForEachIonSpeciesCapCollisionalBoundFreeRates{}(mappingDesc);
 
                 using ForEachIonSpeciesDumpRateCacheToConsole = pmacc::meta::ForEach<
                     AtomicPhysicsIonSpecies,

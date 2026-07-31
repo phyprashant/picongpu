@@ -1,0 +1,395 @@
+/* Copyright 2026 Prashant Sharma
+ *
+ * This file is part of PIConGPU.
+ *
+ * PIConGPU is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * PIConGPU is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with PIConGPU.
+ * If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/** @file kernels of the capCollisionalBoundFreeRates sub-stage of atomicPhysics
+ *
+ * Bounds the collisional bound-free contribution to every atomic state's total loss rate by the instant
+ *  transition rate limit, without changing the equilibrium the collisional bound-free sub-network relaxes to,
+ *  see CollisionalBoundFreePairCap for the model.
+ *
+ * Runs in two kernels after the rate cache has been filled with the un-capped rates:
+ *  1. ComputeCollisionalBoundFreeScaling, deriving each state's scaling factor from its cached un-capped
+ *     collisional bound-free loss rate,
+ *  2. ApplyCollisionalBoundFreeCap, recomputing the two collisional bound-free cache entries of each state with
+ *     the per transition scaling applied.
+ * The second kernel is skipped entirely for every superCell in which no state exceeded the limit.
+ */
+
+#pragma once
+
+#include "picongpu/defines.hpp"
+#include "picongpu/particles/atomicPhysics/CheckSetOfAtomicDataBoxes.hpp"
+#include "picongpu/particles/atomicPhysics/CollisionalBoundFreePairCap.hpp"
+#include "picongpu/particles/atomicPhysics/ConvertEnum.hpp"
+#include "picongpu/particles/atomicPhysics/KernelIndexation.hpp"
+#include "picongpu/particles/atomicPhysics/electronDistribution/CachedHistogram.hpp"
+#include "picongpu/particles/atomicPhysics/enums/ChooseTransitionGroup.hpp"
+#include "picongpu/particles/atomicPhysics/enums/TransitionOrdering.hpp"
+#include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/GetIPD.hpp"
+#include "picongpu/particles/atomicPhysics/rateCalculation/BoundFreeCollisionalTransitionRates.hpp"
+
+#include <pmacc/lockstep/ForEach.hpp>
+#include <pmacc/memory/shared/Allocate.hpp>
+#include <pmacc/static_assert.hpp>
+
+#include <cstdint>
+
+namespace picongpu::particles::atomicPhysics::kernel
+{
+    namespace s_enums = picongpu::particles::atomicPhysics::enums;
+
+    /** derive each atomic state's collisional bound-free scaling factor
+     *
+     * @tparam T_numberAtomicStates number of atomic states in atomic data data base
+     */
+    template<uint32_t T_numberAtomicStates>
+    struct ComputeCollisionalBoundFreeScalingKernel
+    {
+        /** call operator
+         *
+         * @param worker object containing the device and block information, passed by PMACC_KERNEL call
+         * @param areaMapping mapping of blockIndex to block superCell index
+         * @param timeRemainingBox deviceDataBox giving access to the time remaining of all local superCells
+         * @param rateCacheBox deviceDataBox giving access to the rate cache of all local superCells, must hold
+         *  the un-capped collisional bound-free rates
+         */
+        template<typename T_Worker, typename T_AreaMapping, typename T_LocalTimeRemainingBox, typename T_LocalRateCache>
+        HDINLINE void operator()(
+            T_Worker const& worker,
+            T_AreaMapping const areaMapping,
+            T_LocalTimeRemainingBox const timeRemainingBox,
+            T_LocalRateCache rateCacheBox) const
+        {
+            if constexpr(!CollisionalBoundFreePairCap::enabled)
+                return;
+
+            pmacc::DataSpace<picongpu::simDim> const superCellFieldIdx
+                = areaMapping.getSuperCellIndex(worker.blockDomIdxND()) - areaMapping.getGuardingSuperCells();
+
+            // end kernel if superCell already finished
+            if(timeRemainingBox(superCellFieldIdx) <= 0._X)
+                return;
+
+            auto& rateCache = rateCacheBox(superCellFieldIdx);
+
+            auto forEachAtomicState = pmacc::lockstep::makeForEach<T_numberAtomicStates, T_Worker>(worker);
+            forEachAtomicState(
+                [&worker, &rateCache](uint32_t const atomicStateCollectionIndex)
+                {
+                    if(!rateCache.present(atomicStateCollectionIndex))
+                        return;
+
+                    /* un-capped total loss rate of the state's collisional bound-free channels; the pair cap only
+                     *  ever touches these two groups, all other groups keep their rates
+                     * 1/sim.unit.time() */
+                    float_X const collisionalBoundFreeLossRate
+                        = rateCache.rate(
+                              u32(s_enums::ChooseTransitionGroup::collisionalBoundFreeUpward),
+                              atomicStateCollectionIndex)
+                        + rateCache.rate(
+                              u32(s_enums::ChooseTransitionGroup::collisionalBoundFreeDownward),
+                              atomicStateCollectionIndex);
+
+                    // unitless, in (0, 1]
+                    float_X const scalingFactor
+                        = CollisionalBoundFreePairCap::stateScalingFactor(collisionalBoundFreeLossRate);
+
+                    if(scalingFactor < 1._X)
+                    {
+                        rateCache.setCollisionalBoundFreeScaling(atomicStateCollectionIndex, scalingFactor);
+                        rateCache.setAnyCollisionalBoundFreeCapped(worker);
+                    }
+                });
+        }
+    };
+
+    /** recompute the collisional bound-free rate cache entries with the pair cap applied
+     *
+     * @tparam T_IPDModel ionization potential depression model to use
+     *
+     * @tparam T_numberLevels maximum principal quantum number of atomic states of ion species
+     * @tparam T_numberAtomicStates number of atomic states in atomic data data base
+     * @tparam T_numberBins number of regular bins in histogram
+     *
+     * @tparam T_electronicIonization is collisional ionization active?
+     * @tparam T_threeBodyRecombination is three-body recombination active?
+     */
+    template<
+        typename T_IPDModel,
+        uint8_t T_numberLevels,
+        uint32_t T_numberAtomicStates,
+        uint32_t T_numberBins,
+        bool T_electronicIonization,
+        bool T_threeBodyRecombination>
+    struct ApplyCollisionalBoundFreeCapKernel
+    {
+        using VectorIdx = pmacc::DataSpace<picongpu::simDim>;
+
+        /** call operator
+         *
+         * @param worker object containing the device and block information, passed by PMACC_KERNEL call
+         * @param areaMapping mapping of blockIndex to block superCell index
+         * @param timeRemainingBox deviceDataBox giving access to the time remaining of all local superCells
+         * @param rateCacheBox deviceDataBox giving access to the rate cache of all local superCells, must hold
+         *  the per state scaling factors
+         * @param electronHistogramDataBox deviceDataBox giving access to the electron histograms of all local
+         *  superCells
+         * @param chargeStateDataDataBox deviceDataBox giving access to charge state property data
+         * @param atomicStateDataDataBox deviceDataBox giving access to atomic state property data
+         * @param startIndexDataBox deviceDataBox giving access to the start index of each atomic states' block of
+         *  transitions in the up-/down-ward bound-free transition collection
+         * @param numberTransitionsDataBox deviceDataBox giving access to the number of transitions of each atomic
+         *  state up- and down-ward
+         * @param upwardTransitionDataBox bound-free transition property data, ordered by lower state
+         * @param downwardTransitionDataBox bound-free transition property data, ordered by upper state
+         * @param ipdInput deviceDataBoxes giving access to ionization potential depression input for each superCell
+         */
+        template<
+            typename T_Worker,
+            typename T_AreaMapping,
+            typename T_LocalTimeRemainingBox,
+            typename T_LocalRateCacheBox,
+            typename T_LocalElectronHistogramDataBox,
+            typename T_ChargeStateDataDataBox,
+            typename T_AtomicStateDataDataBox,
+            typename T_AtomicStateStartIndexBox,
+            typename T_AtomicStateNumberTransitionsBox,
+            typename T_UpwardBoundFreeTransitionDataBox,
+            typename T_DownwardBoundFreeTransitionDataBox,
+            typename... T_IPDInput>
+        HDINLINE void operator()(
+            T_Worker const& worker,
+            T_AreaMapping const areaMapping,
+            T_LocalTimeRemainingBox const timeRemainingBox,
+            T_LocalRateCacheBox rateCacheBox,
+            T_LocalElectronHistogramDataBox const electronHistogramDataBox,
+            T_ChargeStateDataDataBox const chargeStateDataDataBox,
+            T_AtomicStateDataDataBox const atomicStateDataDataBox,
+            T_AtomicStateStartIndexBox const startIndexDataBox,
+            T_AtomicStateNumberTransitionsBox const numberTransitionsDataBox,
+            T_UpwardBoundFreeTransitionDataBox const upwardTransitionDataBox,
+            T_DownwardBoundFreeTransitionDataBox const downwardTransitionDataBox,
+            T_IPDInput... ipdInput) const
+        {
+            PMACC_CASSERT_MSG(
+                wrong_transition_ordering_for_upward_bound_free_transitions,
+                u8(T_UpwardBoundFreeTransitionDataBox::transitionOrdering)
+                    == u8(s_enums::TransitionOrdering::byLowerState));
+            PMACC_CASSERT_MSG(
+                wrong_transition_ordering_for_downward_bound_free_transitions,
+                u8(T_DownwardBoundFreeTransitionDataBox::transitionOrdering)
+                    == u8(s_enums::TransitionOrdering::byUpperState));
+
+            if constexpr(!CollisionalBoundFreePairCap::enabled)
+                return;
+
+            VectorIdx const superCellIdx = KernelIndexation::getSuperCellIndex(worker, areaMapping);
+            VectorIdx const superCellFieldIdx
+                = KernelIndexation::getSuperCellFieldIndexFromSuperCellIndex(areaMapping, superCellIdx);
+
+            // end kernel if superCell already finished
+            if(timeRemainingBox(superCellFieldIdx) <= 0._X)
+                return;
+
+            auto& rateCache = rateCacheBox(superCellFieldIdx);
+
+            /* nothing to do if the whole collisional bound-free sub-network of this superCell is resolvable,
+             *  which is the regular case */
+            if(!rateCache.anyCollisionalBoundFreeCapped())
+                return;
+
+            PMACC_SMEM(worker, superCellConstantIPDInput, typename T_IPDModel::SuperCellConstantInput);
+            auto onlyMaster = lockstep::makeMaster(worker);
+            onlyMaster(
+                [&superCellConstantIPDInput, &superCellFieldIdx, &ipdInput...]()
+                {
+                    superCellConstantIPDInput = T_IPDModel::getSuperCellConstantInput(superCellFieldIdx, ipdInput...);
+                });
+            worker.sync();
+
+            auto& histogram = electronHistogramDataBox(superCellFieldIdx);
+
+            // picongpu::sim.unit.length()^3
+            constexpr float_X volumeScalingFactor = pmacc::math::CT::volume<picongpu::SuperCellSize>::type::value
+                * picongpu::sim.pic.getCellSize().productOfComponents();
+
+            PMACC_SMEM(worker, cachedHistogram, CachedHistogram<T_numberBins>);
+            cachedHistogram.fill(worker, histogram, volumeScalingFactor);
+
+            // 1/sim.unit.length()^3
+            PMACC_SMEM(worker, densityElectrons, float_X);
+            // eV
+            PMACC_SMEM(worker, temperatureElectrons, float_X);
+            onlyMaster(
+                [&densityElectrons, &temperatureElectrons, &cachedHistogram]()
+                {
+                    densityElectrons = cachedHistogram.electronDensity();
+                    temperatureElectrons = cachedHistogram.temperatureEnergy();
+                });
+            worker.sync();
+
+            using RateCalculation
+                = atomicPhysics::rateCalculation::BoundFreeCollisionalTransitionRates<T_numberLevels>;
+
+            auto forEachAtomicState = pmacc::lockstep::makeForEach<T_numberAtomicStates, T_Worker>(worker);
+            forEachAtomicState(
+                [&rateCache,
+                 &cachedHistogram,
+                 &densityElectrons,
+                 &temperatureElectrons,
+                 &chargeStateDataDataBox,
+                 &atomicStateDataDataBox,
+                 &startIndexDataBox,
+                 &numberTransitionsDataBox,
+                 &upwardTransitionDataBox,
+                 &downwardTransitionDataBox,
+                 &superCellConstantIPDInput](uint32_t const atomicStateCollectionIndex)
+                {
+                    /* not present states have no entries in the rate cache to correct, all their rates are 0 */
+                    if(!rateCache.present(atomicStateCollectionIndex))
+                        return;
+
+                    // upward, i.e. collisional ionization; the state is the lower state of these transitions
+                    if constexpr(T_electronicIonization)
+                    {
+                        uint32_t const numberTransitionsUp
+                            = numberTransitionsDataBox.numberOfTransitionsUp(atomicStateCollectionIndex);
+                        uint32_t const offsetUp
+                            = startIndexDataBox.startIndexBlockTransitionsUp(atomicStateCollectionIndex);
+
+                        /* eV, the state is the lower state of all its upward transitions, same as in the upward
+                         *  fill kernel */
+                        float_X const ionizationPotentialDepression
+                            = ionizationPotentialDepression::template getIPD<T_IPDModel>(
+                                atomicStateDataDataBox,
+                                atomicStateCollectionIndex,
+                                superCellConstantIPDInput);
+
+                        // 1/sim.unit.time()
+                        float_X sumRateTransitions = 0._X;
+                        for(uint32_t transitionID = 0u; transitionID < numberTransitionsUp; ++transitionID)
+                        {
+                            uint32_t const transitionCollectionIndex = offsetUp + transitionID;
+
+                            // 1/sim.unit.time()
+                            float_X sumRateCollisionalIonization = 0._X;
+                            for(uint32_t binIndex = 0u; binIndex < T_numberBins; ++binIndex)
+                            {
+                                sumRateCollisionalIonization += RateCalculation::
+                                    template rateCollisionalIonizationTransition<
+                                        T_ChargeStateDataDataBox,
+                                        T_AtomicStateDataDataBox,
+                                        T_UpwardBoundFreeTransitionDataBox>(
+                                        cachedHistogram.energy[binIndex],
+                                        cachedHistogram.binWidth[binIndex],
+                                        cachedHistogram.rateDensity[binIndex],
+                                        cachedHistogram.densitySlopeToNextBin(binIndex),
+                                        ionizationPotentialDepression,
+                                        transitionCollectionIndex,
+                                        chargeStateDataDataBox,
+                                        atomicStateDataDataBox,
+                                        upwardTransitionDataBox);
+                            }
+
+                            sumRateTransitions += CollisionalBoundFreePairCap::transitionScalingFactor(
+                                                      rateCache,
+                                                      atomicStateCollectionIndex,
+                                                      upwardTransitionDataBox.upperStateCollectionIndex(
+                                                          transitionCollectionIndex))
+                                * sumRateCollisionalIonization;
+                        }
+
+                        rateCache.template setRate<s_enums::ChooseTransitionGroup::collisionalBoundFreeUpward>(
+                            atomicStateCollectionIndex,
+                            sumRateTransitions);
+                    }
+
+                    // downward, i.e. three-body recombination; the state is the upper state of these transitions
+                    if constexpr(T_threeBodyRecombination)
+                    {
+                        uint32_t const numberTransitionsDown
+                            = numberTransitionsDataBox.numberOfTransitionsDown(atomicStateCollectionIndex);
+                        uint32_t const offsetDown
+                            = startIndexDataBox.startIndexBlockTransitionsDown(atomicStateCollectionIndex);
+
+                        // 1/sim.unit.time()
+                        float_X sumRateTransitions = 0._X;
+                        for(uint32_t transitionID = 0u; transitionID < numberTransitionsDown; ++transitionID)
+                        {
+                            uint32_t const transitionCollectionIndex = offsetDown + transitionID;
+
+                            // eV, same lower-state threshold convention as the upward ionization of this transition
+                            float_X const ionizationPotentialDepression
+                                = ionizationPotentialDepression::template getBoundFreeLowerStateIPD<T_IPDModel>(
+                                    atomicStateDataDataBox,
+                                    downwardTransitionDataBox,
+                                    transitionCollectionIndex,
+                                    superCellConstantIPDInput);
+
+                            // 1/sim.unit.time()
+                            float_X sumRateCollisionalIonization = 0._X;
+                            for(uint32_t binIndex = 0u; binIndex < T_numberBins; ++binIndex)
+                            {
+                                sumRateCollisionalIonization += RateCalculation::
+                                    template rateCollisionalIonizationTransition<
+                                        T_ChargeStateDataDataBox,
+                                        T_AtomicStateDataDataBox,
+                                        T_DownwardBoundFreeTransitionDataBox>(
+                                        cachedHistogram.energy[binIndex],
+                                        cachedHistogram.binWidth[binIndex],
+                                        cachedHistogram.rateDensity[binIndex],
+                                        cachedHistogram.densitySlopeToNextBin(binIndex),
+                                        ionizationPotentialDepression,
+                                        transitionCollectionIndex,
+                                        chargeStateDataDataBox,
+                                        atomicStateDataDataBox,
+                                        downwardTransitionDataBox);
+                            }
+
+                            // 1/sim.unit.time()
+                            float_X const transitionRate
+                                = RateCalculation::template rateCollisionalThreeBodyRecombinationTransition<
+                                    T_ChargeStateDataDataBox,
+                                    T_AtomicStateDataDataBox,
+                                    T_DownwardBoundFreeTransitionDataBox>(
+                                    temperatureElectrons,
+                                    densityElectrons,
+                                    sumRateCollisionalIonization,
+                                    ionizationPotentialDepression,
+                                    transitionCollectionIndex,
+                                    chargeStateDataDataBox,
+                                    atomicStateDataDataBox,
+                                    downwardTransitionDataBox);
+
+                            sumRateTransitions += CollisionalBoundFreePairCap::transitionScalingFactor(
+                                                      rateCache,
+                                                      downwardTransitionDataBox.lowerStateCollectionIndex(
+                                                          transitionCollectionIndex),
+                                                      atomicStateCollectionIndex)
+                                * transitionRate;
+                        }
+
+                        rateCache.template setRate<s_enums::ChooseTransitionGroup::collisionalBoundFreeDownward>(
+                            atomicStateCollectionIndex,
+                            sumRateTransitions);
+                    }
+                });
+        }
+    };
+} // namespace picongpu::particles::atomicPhysics::kernel

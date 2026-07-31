@@ -69,6 +69,14 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
          */
         // unitless
         uint32_t m_present[numberAtomicStates] = {static_cast<uint32_t>(false)};
+        /* per state scaling factor of the collisional bound-free rates, see CollisionalBoundFreePairCap
+         * @attention 0, the reset value of the cache, means "not capped" and is read back as 1
+         * unitless, in [0, 1] */
+        float_X m_collisionalBoundFreeScaling[numberAtomicStates] = {0._X};
+        /* did any state of this superCell have to be capped? lets all consumers skip the capping entirely in the
+         *  regular case of a fully resolvable collisional bound-free sub-network
+         * unitless */
+        uint32_t m_anyCollisionalBoundFreeCapped = static_cast<uint32_t>(false);
 
         /** get linear storage index
          *
@@ -274,6 +282,95 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
                 static_cast<uint32_t>(status),
                 ::alpaka::hierarchy::Threads{});
             return;
+        }
+
+        /** overwrite a cache entry, no atomics
+         *
+         * @tparam T_ChooseTransitionGroup ChooseTransitionGroup to set the rate of
+         *
+         * @param collectionIndex collection index of atomic state to set rate of
+         * @param rate rate of transition group, [1/sim.unit.time()]
+         *
+         * @attention no range checks outside a debug compile, invalid memory write on failure
+         * @attention only use if only ever one thread accesses each rate cache entry!
+         */
+        template<particles::atomicPhysics::enums::ChooseTransitionGroup T_ChooseTransitionGroup>
+        HDINLINE void setRate(uint32_t const collectionIndex, float_X const rate)
+        {
+            PMACC_CASSERT(checkIsStoredChooseTransitionGroup<T_ChooseTransitionGroup>());
+
+            if constexpr(picongpu::atomicPhysics::debug::rateCache::COLLECTION_INDEX_RANGE_CHECKS)
+                if(collectionIndex >= numberAtomicStates)
+                {
+                    printf("atomicPhysics ERROR: out of range in setRate() call on RateCache\n");
+                    return;
+                }
+
+            rateEntries[linearIndex(collectionIndex, u32(T_ChooseTransitionGroup))] = rate;
+            return;
+        }
+
+        /** set the collisional bound-free rate scaling factor of an atomic state, no atomics
+         *
+         * @param collectionIndex collection index of atomic state
+         * @param scalingFactor unitless, in (0, 1]
+         *
+         * @attention no range checks outside a debug compile, invalid memory write on failure
+         * @attention only use if only ever one thread accesses each atomic state's entry!
+         */
+        HDINLINE void setCollisionalBoundFreeScaling(uint32_t const collectionIndex, float_X const scalingFactor)
+        {
+            if constexpr(picongpu::atomicPhysics::debug::rateCache::COLLECTION_INDEX_RANGE_CHECKS)
+                if(collectionIndex >= numberAtomicStates)
+                {
+                    printf("atomicPhysics ERROR: out of range in setCollisionalBoundFreeScaling() call on rateCache\n");
+                    return;
+                }
+
+            m_collisionalBoundFreeScaling[collectionIndex] = scalingFactor;
+            return;
+        }
+
+        /** get the collisional bound-free rate scaling factor of an atomic state
+         *
+         * @param collectionIndex collection index of atomic state
+         * @return unitless, in (0, 1], 1 for an un-capped state
+         *
+         * @attention no range checks outside a debug compile, invalid memory access on failure
+         */
+        HDINLINE float_X collisionalBoundFreeScaling(uint32_t const collectionIndex) const
+        {
+            if constexpr(picongpu::atomicPhysics::debug::rateCache::COLLECTION_INDEX_RANGE_CHECKS)
+                if(collectionIndex >= numberAtomicStates)
+                {
+                    printf("atomicPhysics ERROR: out of range in collisionalBoundFreeScaling() call on rateCache\n");
+                    return 1._X;
+                }
+
+            // 0 is the reset value of the cache and marks an un-capped state
+            float_X const storedScalingFactor = m_collisionalBoundFreeScaling[collectionIndex];
+            return (storedScalingFactor > 0._X) ? storedScalingFactor : 1._X;
+        }
+
+        /** mark this superCell as containing at least one capped atomic state
+         *
+         * @param worker object containing the device and block information
+         */
+        template<typename T_Worker>
+        HDINLINE void setAnyCollisionalBoundFreeCapped(T_Worker const& worker)
+        {
+            alpaka::atomicExch(
+                worker.getAcc(),
+                &(this->m_anyCollisionalBoundFreeCapped),
+                static_cast<uint32_t>(true),
+                ::alpaka::hierarchy::Threads{});
+            return;
+        }
+
+        //! does any atomic state of this superCell have capped collisional bound-free rates?
+        HDINLINE bool anyCollisionalBoundFreeCapped() const
+        {
+            return m_anyCollisionalBoundFreeCapped;
         }
 
         /** get cached rate for an atomic state

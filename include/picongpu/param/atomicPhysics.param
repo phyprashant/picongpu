@@ -66,6 +66,25 @@ namespace picongpu::atomicPhysics
          * subs-steps than set here.
          */
         static constexpr uint32_t maximumNumberSubStepsPerPICTimeStep = 200u;
+
+        /** bound the collisional bound-free contribution to a state's loss rate by the instant transition limit
+         *
+         * At high electron density the collisional ionization rates of an atomic state and their detailed
+         *  balance inverses, three-body recombination, can far exceed
+         *  timeStepAlpha * maximumNumberSubStepsPerPICTimeStep / dt_PIC, i.e. the collisional bound-free
+         *  sub-network reaches its Saha equilibrium faster than the smallest sub-step we are willing to take.
+         *  Resolving that relaxation costs an unbounded number of sub-steps without changing the result, the
+         *  sub-network is at its equilibrium at the end of the PIC time step either way.
+         *
+         * If enabled, both directions of every bound-free transition are scaled by a common factor, chosen so
+         *  that no state's collisional bound-free loss rate exceeds the limit. This leaves the ratio of the two
+         *  directions, and therefore the equilibrium the sub-network relaxes to, exact; only the (unresolvable
+         *  anyway) transient is stretched.
+         *  See particles/atomicPhysics/CollisionalBoundFreePairCap.hpp for the model.
+         *
+         * @attention no effect unless a state actually exceeds the limit
+         */
+        static constexpr bool capCollisionalBoundFreePairRates = true;
     };
 
     /** atomicConfigNumber definition for argon ions
