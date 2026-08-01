@@ -32,6 +32,7 @@
 #include "picongpu/particles/atomicPhysics/kernel/ChooseTransition_CollisionalBoundFreeDownward.kernel"
 #include "picongpu/particles/atomicPhysics/kernel/ChooseTransition_FieldBoundFree.kernel"
 #include "picongpu/particles/atomicPhysics/kernel/ChooseTransition_RadiativeBoundFreeDownward.kernel"
+#include "picongpu/particles/atomicPhysics/localHelperFields/BoundFreeTransitionRateCacheField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/RateCacheField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/TimeRemainingField.hpp"
 #include "picongpu/particles/param.hpp"
@@ -185,6 +186,10 @@ namespace picongpu::particles::atomicPhysics::stage
             // bound-free(downward) collisional transitions, i.e. three-body recombination
             if constexpr(AtomicDataType::switchThreeBodyRecombination)
             {
+                auto& transitionRateCacheField = *dc.get<picongpu::particles::atomicPhysics::localHelperFields::
+                    BoundFreeTransitionRateCacheField<picongpu::MappingDesc, IonSpecies>>(
+                    IonSpecies::FrameType::getName() + "_boundFreeTransitionRateCacheField");
+
                 using ChooseTransitionKernel_CollisionalBoundFreeDownward = picongpu::particles::atomicPhysics::
                     kernel::ChooseTransitionKernel_CollisionalBoundFreeDownward<
                         picongpu::atomicPhysics::ElectronHistogram,
@@ -206,6 +211,7 @@ namespace picongpu::particles::atomicPhysics::stage
                     timeRemainingField.getDeviceDataBox(),
                     electronHistogramField.getDeviceDataBox(),
                     rateCacheField.getDeviceDataBox(),
+                    transitionRateCacheField.getDeviceDataBox(),
                     ions.getDeviceParticlesBox());
             }
 

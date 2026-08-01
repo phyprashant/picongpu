@@ -20,8 +20,10 @@
 #pragma once
 
 #include "picongpu/particles/atomicPhysics/debug/param.hpp"
+#include "picongpu/particles/atomicPhysics/localHelperFields/BoundFreeTransitionRateCacheField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/RateCacheField.hpp"
 #include "picongpu/particles/param.hpp"
+#include "picongpu/particles/traits/GetAtomicDataType.hpp"
 
 #include <pmacc/particles/meta/FindByNameOrType.hpp>
 
@@ -48,6 +50,17 @@ namespace picongpu::particles::atomicPhysics::stage
             auto rateCacheField = std::make_unique<picongpu::particles::atomicPhysics::localHelperFields::
                                                        RateCacheField<picongpu::MappingDesc, IonSpecies>>(mappingDesc);
             dataConnector.consume(std::move(rateCacheField));
+
+            using AtomicDataType = typename picongpu::traits::GetAtomicDataType<IonSpecies>::type;
+            if constexpr(AtomicDataType::switchThreeBodyRecombination)
+            {
+                auto atomicData = dataConnector.get<AtomicDataType>(IonSpecies::FrameType::getName() + "_atomicData");
+                auto transitionRateCacheField = std::make_unique<picongpu::particles::atomicPhysics::
+                    localHelperFields::BoundFreeTransitionRateCacheField<picongpu::MappingDesc, IonSpecies>>(
+                    mappingDesc,
+                    atomicData->getNumberBoundFreeTransitions());
+                dataConnector.consume(std::move(transitionRateCacheField));
+            }
         }
     };
 } // namespace picongpu::particles::atomicPhysics::stage

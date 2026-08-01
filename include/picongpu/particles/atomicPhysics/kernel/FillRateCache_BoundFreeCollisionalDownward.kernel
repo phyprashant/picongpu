@@ -82,6 +82,8 @@ namespace picongpu::particles::atomicPhysics::kernel
          * @param areaMapping mapping of blockIndex to block superCell index
          * @param timeRemainingBox deviceDataBox giving access to the time remaining of all local superCells
          * @param rateCacheBox deviceDataBox giving access to the rate cache of all local superCells
+         * @param transitionRateCacheBox deviceDataBox caching each downward bound-free transition rate for reuse
+         *  during transition selection
          * @param electronHistogramDataBox deviceDataBox giving access to the electron histograms of all local
          *  superCells
          * @param chargeStateDataDataBox deviceDataBox giving access to charge state property data
@@ -98,6 +100,7 @@ namespace picongpu::particles::atomicPhysics::kernel
             typename T_AreaMapping,
             typename T_LocalTimeRemainingBox,
             typename T_LocalRateCacheBox,
+            typename T_BoundFreeTransitionRateCacheBox,
             typename T_LocalElectronHistogramDataBox,
             typename T_ChargeStateDataDataBox,
             typename T_AtomicStateDataDataBox,
@@ -110,6 +113,7 @@ namespace picongpu::particles::atomicPhysics::kernel
             T_AreaMapping const areaMapping,
             T_LocalTimeRemainingBox const timeRemainingBox,
             T_LocalRateCacheBox rateCacheBox,
+            T_BoundFreeTransitionRateCacheBox transitionRateCacheBox,
             T_LocalElectronHistogramDataBox const electronHistogramDataBox,
             T_ChargeStateDataDataBox const chargeStateDataDataBox,
             T_AtomicStateDataDataBox const atomicStateDataDataBox,
@@ -178,6 +182,8 @@ namespace picongpu::particles::atomicPhysics::kernel
             auto forEachAtomicState = pmacc::lockstep::makeForEach<T_numberAtomicStates, T_Worker>(worker);
             forEachAtomicState(
                 [&rateCache,
+                 &transitionRateCacheBox,
+                 &superCellFieldIdx,
                  &cachedHistogram,
                  &densityElectrons,
                  &temperatureElectrons,
@@ -255,6 +261,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                                     chargeStateDataDataBox,
                                     atomicStateDataDataBox,
                                     boundFreeTransitionDataBox);
+                        transitionRateCacheBox.rate(superCellFieldIdx, transitionCollectionIndex) = transitionRate;
                         sumRateTransitions += transitionRate;
 
                         // debug pair rate, three-body recombination goes from upper to lower state

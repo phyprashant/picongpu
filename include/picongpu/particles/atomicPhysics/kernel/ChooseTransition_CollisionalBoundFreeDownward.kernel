@@ -144,6 +144,8 @@ namespace picongpu::particles::atomicPhysics::kernel
          *  electron histograms of all local superCells
          * @param rateCacheBox deviceDataBox giving access to the sum of all transitions rates for each
          *  chooseTransitionGroup cache previously filled by the FillRateCache sub-stage
+         * @param transitionRateCacheBox deviceDataBox giving access to the downward bound-free transition rates
+         *  calculated by the FillRateCache sub-stage
          * @param ionBox deviceDataBox giving access to the ion frames of all local superCells
          * @param ipdInput everything required by T_IPDModel to calculate the IonizationPotentialDepression,
          *  passed by T_IPDModel::callKernelWithIPDInput
@@ -160,6 +162,7 @@ namespace picongpu::particles::atomicPhysics::kernel
             typename T_LocalTimeRemainingBox,
             typename T_LocalElectronHistogramDataBox,
             typename T_LocalRateCacheBox,
+            typename T_BoundFreeTransitionRateCacheBox,
             typename T_IonBox,
             typename... T_IPDInput>
         HDINLINE void operator()(
@@ -174,6 +177,7 @@ namespace picongpu::particles::atomicPhysics::kernel
             T_LocalTimeRemainingBox const timeRemainingBox,
             T_LocalElectronHistogramDataBox electronHistogramDataBox,
             T_LocalRateCacheBox rateCacheBox,
+            T_BoundFreeTransitionRateCacheBox const transitionRateCacheBox,
             T_IonBox ionBox,
             T_IPDInput const... ipdInput) const
         {
@@ -207,24 +211,15 @@ namespace picongpu::particles::atomicPhysics::kernel
             PMACC_SMEM(worker, cachedHistogram, CachedHistogram<T_Histogram::numberBins>);
             cachedHistogram.fill(worker, electronHistogram, volumeScalingFactor);
 
-            // 1/sim.unit.length()^3
-            PMACC_SMEM(worker, densityElectrons, float_X);
-            // eV
-            PMACC_SMEM(worker, temperatureElectrons, float_X);
             PMACC_SMEM(worker, superCellConstantIPDInput, typename T_IPDModel::SuperCellConstantInput);
 
             auto onlyMaster = lockstep::makeMaster(worker);
             onlyMaster(
                 [&superCellConstantIPDInput,
-                 &densityElectrons,
-                 &temperatureElectrons,
-                 &cachedHistogram,
                  &superCellFieldIdx,
                  &ipdInput...]()
                 {
                     superCellConstantIPDInput = T_IPDModel::getSuperCellConstantInput(superCellFieldIdx, ipdInput...);
-                    densityElectrons = cachedHistogram.electronDensity();
-                    temperatureElectrons = cachedHistogram.temperatureEnergy();
                 });
             worker.sync();
 
@@ -238,8 +233,8 @@ namespace picongpu::particles::atomicPhysics::kernel
                  &transitionDataBox,
                  &cachedHistogram,
                  &rateCache,
-                 &densityElectrons,
-                 &temperatureElectrons,
+                 &transitionRateCacheBox,
+                 &superCellFieldIdx,
                  &superCellConstantIPDInput](T_Worker const& worker, auto& ion)
                 {
                     // debug
@@ -306,27 +301,6 @@ namespace picongpu::particles::atomicPhysics::kernel
                                 transitionIndex,
                                 superCellConstantIPDInput);
 
-                        // 1/sim.unit.time()
-                        float_X sumRateCollisionalIonization = 0._X;
-                        for(uint32_t binIndex = 0u; binIndex < numberBins; ++binIndex)
-                        {
-                            sumRateCollisionalIonization += picongpu::particles::atomicPhysics::rateCalculation::
-                                BoundFreeCollisionalTransitionRates<T_n_max>::
-                                    template rateCollisionalIonizationTransition<
-                                        T_ChargeStateDataDataBox,
-                                        T_AtomicStateDataDataBox,
-                                        T_BoundFreeTransitionDataBox>(
-                                        cachedHistogram.energy[binIndex],
-                                        cachedHistogram.binWidth[binIndex],
-                                        cachedHistogram.rateDensity[binIndex],
-                                        cachedHistogram.densitySlopeToNextBin(binIndex),
-                                        ionizationPotentialDepression,
-                                        transitionIndex,
-                                        chargeStateDataDataBox,
-                                        atomicStateDataDataBox,
-                                        transitionDataBox);
-                        }
-
                         /* must repeat the capping of the capCollisionalBoundFreeRates sub-stage, stateTotalLossrate
                          *  we normalize against already holds the capped rates
                          * unitless, in (0, 1] */
@@ -338,21 +312,8 @@ namespace picongpu::particles::atomicPhysics::kernel
                             : 1._X;
 
                         // 1/sim.unit.time()
-                        float_X const rateTransition = pairScaling
-                            * picongpu::particles::atomicPhysics::rateCalculation::
-                                BoundFreeCollisionalTransitionRates<T_n_max>::
-                                    template rateCollisionalThreeBodyRecombinationTransition<
-                                        T_ChargeStateDataDataBox,
-                                        T_AtomicStateDataDataBox,
-                                        T_BoundFreeTransitionDataBox>(
-                                        temperatureElectrons,
-                                        densityElectrons,
-                                        sumRateCollisionalIonization,
-                                        ionizationPotentialDepression,
-                                        transitionIndex,
-                                        chargeStateDataDataBox,
-                                        atomicStateDataDataBox,
-                                        transitionDataBox);
+                        float_X const rateTransition
+                            = pairScaling * transitionRateCacheBox.rate(superCellFieldIdx, transitionIndex);
 
                         if(rateTransition <= 0._X)
                             continue;
