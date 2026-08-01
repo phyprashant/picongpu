@@ -190,6 +190,11 @@ namespace picongpu::particles::atomicPhysics::kernel
                 {
                     bool const atomicStatePresent = rateCache.present(atomicStateCollectionIndex);
 
+                    // In production builds pair rates are not recorded, so an absent state has no observable work.
+                    if constexpr(!picongpu::atomicPhysics::debug::rateCache::PRINT_TO_CONSOLE)
+                        if(!atomicStatePresent)
+                            return;
+
                     uint32_t const numberTransitionsDown
                         = numberTransitionsDataBox.numberOfTransitionsDown(atomicStateCollectionIndex);
                     uint32_t const offset
