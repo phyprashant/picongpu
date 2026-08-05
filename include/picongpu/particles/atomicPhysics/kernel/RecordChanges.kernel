@@ -202,9 +202,9 @@ namespace picongpu::particles::atomicPhysics::kernel
                                      USE_FIXED_RATE_INSTEAD_OF_RATE_CALCULATION)
                         return;
 
-                    // record used energy
+                    // record used energy. The histogram stores weighted electron-energy changes.
                     if constexpr(isCollisional)
-                        electronHistogram.addDeltaEnergy(worker, ion[binIndex_], deltaEnergy);
+                        electronHistogram.addDeltaEnergy(worker, ion[binIndex_], deltaEnergy * ion[weighting_]);
                 });
         }
     };
