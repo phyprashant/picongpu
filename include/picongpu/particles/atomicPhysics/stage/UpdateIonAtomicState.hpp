@@ -25,6 +25,7 @@
 #include "picongpu/particles/atomicPhysics/electronDistribution/LocalHistogramField.hpp"
 #include "picongpu/particles/atomicPhysics/enums/ProcessClass.hpp"
 #include "picongpu/particles/atomicPhysics/kernel/UpdateIonAtomicState.kernel"
+#include "picongpu/particles/atomicPhysics/localHelperFields/AtomicEnergyExchangeField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/TimeRemainingField.hpp"
 #include "picongpu/particles/param.hpp"
 
@@ -63,21 +64,30 @@ namespace picongpu::particles::atomicPhysics::stage
                         "TimeRemainingField");
                 auto ions = dc.get<IonSpecies>(IonSpecies::FrameType::getName());
                 auto atomicData = dc.get<AtomicDataType>(IonSpecies::FrameType::getName() + "_atomicData");
+                auto atomicEnergyExchangeField
+                    = dc.get<particles::atomicPhysics::localHelperFields::AtomicEnergyExchangeField<
+                        picongpu::MappingDesc,
+                        IonSpecies>>(IonSpecies::FrameType::getName() + "_atomicEnergyExchangeField");
 
                 namespace s_enums = particles::atomicPhysics::enums;
 
                 using UpdateIonAtomicState_fieldIonization
                     = picongpu::particles::atomicPhysics::kernel::UpdateIonAtomicStateKernel<
-                        s_enums::ProcessClass::fieldIonization>;
-                PMACC_LOCKSTEP_KERNEL(UpdateIonAtomicState_fieldIonization())
-                    .config(mapper.getGridDim(), *ions)(
-                        mapper,
-                        timeRemainingField->getDeviceDataBox(),
-                        ions->getDeviceParticlesBox(),
-                        atomicData->template getAtomicStateDataDataBox<false>(),
-                        atomicData->template getBoundFreeTransitionDataBox<
-                            false,
-                            s_enums::TransitionOrdering::byLowerState>());
+                        s_enums::ProcessClass::fieldIonization,
+                        picongpu::atomicPhysics::IPDModel>;
+                picongpu::atomicPhysics::IPDModel::template callKernelWithIPDInput<
+                    UpdateIonAtomicState_fieldIonization,
+                    IonSpecies::FrameType::frameSize>(
+                    dc,
+                    mapper,
+                    timeRemainingField->getDeviceDataBox(),
+                    ions->getDeviceParticlesBox(),
+                    atomicData->template getAtomicStateDataDataBox<false>(),
+                    atomicData->template getBoundFreeTransitionDataBox<
+                        false,
+                        s_enums::TransitionOrdering::byLowerState>(),
+                    atomicEnergyExchangeField->getDeviceDataBox(),
+                    atomicData->template getChargeStateDataDataBox<false>());
             }
         }
     };

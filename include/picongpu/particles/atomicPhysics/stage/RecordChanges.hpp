@@ -25,6 +25,7 @@
 #include "picongpu/particles/atomicPhysics/electronDistribution/LocalHistogramField.hpp"
 #include "picongpu/particles/atomicPhysics/enums/ProcessClass.hpp"
 #include "picongpu/particles/atomicPhysics/kernel/RecordChanges.kernel"
+#include "picongpu/particles/atomicPhysics/localHelperFields/AtomicEnergyExchangeField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/CapturedWeightCacheField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/TimeRemainingField.hpp"
 #include "picongpu/particles/param.hpp"
@@ -75,6 +76,11 @@ namespace picongpu::particles::atomicPhysics::stage
 
             auto& atomicData = *dc.get<AtomicDataType>(IonSpecies::FrameType::getName() + "_atomicData");
 
+            auto& atomicEnergyExchangeField
+                = *dc.get<picongpu::particles::atomicPhysics::localHelperFields::AtomicEnergyExchangeField<
+                    picongpu::MappingDesc,
+                    IonSpecies>>(IonSpecies::FrameType::getName() + "_atomicEnergyExchangeField");
+
             namespace s_enums = picongpu::particles::atomicPhysics::enums;
 
             if constexpr(AtomicDataType::switchElectronicExcitation)
@@ -91,7 +97,8 @@ namespace picongpu::particles::atomicPhysics::stage
                         atomicData.template getAtomicStateDataDataBox<false>(),
                         atomicData.template getBoundBoundTransitionDataBox<
                             false,
-                            s_enums::TransitionOrdering::byLowerState>());
+                            s_enums::TransitionOrdering::byLowerState>(),
+                        atomicEnergyExchangeField.getDeviceDataBox());
             }
 
             if constexpr(AtomicDataType::switchElectronicDeexcitation)
@@ -108,7 +115,8 @@ namespace picongpu::particles::atomicPhysics::stage
                         atomicData.template getAtomicStateDataDataBox<false>(),
                         atomicData.template getBoundBoundTransitionDataBox<
                             false,
-                            s_enums::TransitionOrdering::byUpperState>());
+                            s_enums::TransitionOrdering::byUpperState>(),
+                        atomicEnergyExchangeField.getDeviceDataBox());
             }
 
             if constexpr(AtomicDataType::switchSpontaneousDeexcitation)
@@ -125,7 +133,8 @@ namespace picongpu::particles::atomicPhysics::stage
                         atomicData.template getAtomicStateDataDataBox<false>(),
                         atomicData.template getBoundBoundTransitionDataBox<
                             false,
-                            s_enums::TransitionOrdering::byUpperState>());
+                            s_enums::TransitionOrdering::byUpperState>(),
+                        atomicEnergyExchangeField.getDeviceDataBox());
             }
 
             if constexpr(AtomicDataType::switchElectronicIonization)
@@ -144,6 +153,7 @@ namespace picongpu::particles::atomicPhysics::stage
                     atomicData.template getAtomicStateDataDataBox<false>(),
                     atomicData
                         .template getBoundFreeTransitionDataBox<false, s_enums::TransitionOrdering::byLowerState>(),
+                    atomicEnergyExchangeField.getDeviceDataBox(),
                     atomicData.template getChargeStateDataDataBox<false>());
             }
 
@@ -163,6 +173,7 @@ namespace picongpu::particles::atomicPhysics::stage
                     atomicData.template getAtomicStateDataDataBox<false>(),
                     atomicData
                         .template getBoundFreeTransitionDataBox<false, s_enums::TransitionOrdering::byLowerState>(),
+                    atomicEnergyExchangeField.getDeviceDataBox(),
                     atomicData.template getChargeStateDataDataBox<false>());
             }
 
@@ -187,6 +198,7 @@ namespace picongpu::particles::atomicPhysics::stage
                     atomicData
                         .template getBoundFreeTransitionDataBox<false, s_enums::TransitionOrdering::byUpperState>(),
                     capturedWeightCacheField.getDeviceDataBox(),
+                    atomicEnergyExchangeField.getDeviceDataBox(),
                     atomicData.template getChargeStateDataDataBox<false>());
             }
 
@@ -199,15 +211,20 @@ namespace picongpu::particles::atomicPhysics::stage
                     = *dc.get<picongpu::particles::atomicPhysics::localHelperFields::CapturedWeightCacheField<
                         picongpu::MappingDesc>>("CapturedWeightCacheField");
 
-                PMACC_LOCKSTEP_KERNEL(RecordChanges_radiativeRecombination())
-                    .config(mapper.getGridDim(), ions)(
-                        mapper,
-                        timeRemainingField.getDeviceDataBox(),
-                        ions.getDeviceParticlesBox(),
-                        atomicData.template getAtomicStateDataDataBox<false>(),
-                        atomicData
-                            .template getBoundFreeTransitionDataBox<false, s_enums::TransitionOrdering::byUpperState>(),
-                        capturedWeightCacheField.getDeviceDataBox());
+                IPDModel::template callKernelWithIPDInput<
+                    RecordChanges_radiativeRecombination,
+                    IonSpecies::FrameType::frameSize>(
+                    dc,
+                    mapper,
+                    timeRemainingField.getDeviceDataBox(),
+                    ions.getDeviceParticlesBox(),
+                    electronHistogramField.getDeviceDataBox(),
+                    atomicData.template getAtomicStateDataDataBox<false>(),
+                    atomicData
+                        .template getBoundFreeTransitionDataBox<false, s_enums::TransitionOrdering::byUpperState>(),
+                    capturedWeightCacheField.getDeviceDataBox(),
+                    atomicEnergyExchangeField.getDeviceDataBox(),
+                    atomicData.template getChargeStateDataDataBox<false>());
             }
 
             if constexpr(AtomicDataType::switchAutonomousIonization)
@@ -225,7 +242,9 @@ namespace picongpu::particles::atomicPhysics::stage
                     electronHistogramField.getDeviceDataBox(),
                     atomicData.template getAtomicStateDataDataBox<false>(),
                     atomicData
-                        .template getAutonomousTransitionDataBox<false, s_enums::TransitionOrdering::byUpperState>());
+                        .template getAutonomousTransitionDataBox<false, s_enums::TransitionOrdering::byUpperState>(),
+                    atomicEnergyExchangeField.getDeviceDataBox(),
+                    atomicData.template getChargeStateDataDataBox<false>());
             }
         }
     };

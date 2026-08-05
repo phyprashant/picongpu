@@ -24,6 +24,7 @@
 #include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/LocalIPDInputFields.hpp"
 #include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/kernel/ApplyIPDIonization.kernel"
 #include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/stage/ApplyIPDIonization.def"
+#include "picongpu/particles/atomicPhysics/localHelperFields/AtomicEnergyExchangeField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/FoundUnboundIonField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/TimeRemainingField.hpp"
 #include "picongpu/particles/atomicPhysics/spawnFromSourceSpeciesModules/NeverSkipSuperCells.hpp"
@@ -65,6 +66,10 @@ namespace picongpu::particles::atomicPhysics::ionizationPotentialDepression::sta
         auto& foundUnboundIonField
             = *dc.get<atomicPhysics::localHelperFields::FoundUnboundIonField<picongpu::MappingDesc>>(
                 "FoundUnboundIonField");
+        auto& atomicEnergyExchangeField
+            = *dc.get<atomicPhysics::localHelperFields::AtomicEnergyExchangeField<
+                picongpu::MappingDesc,
+                IonSpecies>>(IonSpecies::FrameType::getName() + "_atomicEnergyExchangeField");
 
         auto& ions = *dc.get<IonSpecies>(IonSpecies::FrameType::getName());
         auto& electrons = *dc.get<IonizationElectronSpecies>(IonizationElectronSpecies::FrameType::getName());
@@ -100,6 +105,7 @@ namespace picongpu::particles::atomicPhysics::ionizationPotentialDepression::sta
                     electrons.getDeviceParticlesBox(),
                     timeRemainingField.getDeviceDataBox(),
                     foundUnboundIonField.getDeviceDataBox(),
+                    atomicEnergyExchangeField.getDeviceDataBox(),
                     atomicData.template getChargeStateDataDataBox</*on device*/ false>(),
                     atomicData.template getAtomicStateDataDataBox</*on device*/ false>(),
                     atomicData.template getIPDIonizationStateDataBox</*on device*/ false>(),
@@ -123,6 +129,7 @@ namespace picongpu::particles::atomicPhysics::ionizationPotentialDepression::sta
                     electrons.getDeviceParticlesBox(),
                     timeRemainingField.getDeviceDataBox(),
                     foundUnboundIonField.getDeviceDataBox(),
+                    atomicEnergyExchangeField.getDeviceDataBox(),
                     atomicData.template getChargeStateDataDataBox</*on device*/ false>(),
                     atomicData.template getAtomicStateDataDataBox</*on device*/ false>(),
                     atomicData.template getIPDIonizationStateDataBox</*on device*/ false>(),

@@ -67,6 +67,7 @@ namespace picongpu::particles::atomicPhysics::ionizationPotentialDepression::ker
             //!@{
             typename T_LocalTimeRemainingBox,
             typename T_FoundUnboundIonBox,
+            typename T_AtomicEnergyExchangeBox,
             typename T_ChargeStateDataBox,
             typename T_AtomicStateDataBox,
             typename T_IPDIonizationStateDataBox,
@@ -79,6 +80,7 @@ namespace picongpu::particles::atomicPhysics::ionizationPotentialDepression::ker
             pmacc::DataSpace<picongpu::simDim> const,
             T_LocalTimeRemainingBox const,
             T_FoundUnboundIonBox const,
+            T_AtomicEnergyExchangeBox const,
             T_ChargeStateDataBox const,
             T_AtomicStateDataBox const,
             T_IPDIonizationStateDataBox const,
@@ -105,6 +107,7 @@ namespace picongpu::particles::atomicPhysics::ionizationPotentialDepression::ker
             typename T_KernelState,
             typename T_LocalTimeRemainingBox,
             typename T_FoundUnboundIonBox,
+            typename T_AtomicEnergyExchangeBox,
             typename T_ChargeStateDataBox,
             typename T_AtomicStateDataBox,
             typename T_IPDIonizationStateDataBox,
@@ -116,6 +119,7 @@ namespace picongpu::particles::atomicPhysics::ionizationPotentialDepression::ker
             pmacc::DataSpace<picongpu::simDim> const superCellFieldIndex,
             T_LocalTimeRemainingBox const,
             T_FoundUnboundIonBox const,
+            T_AtomicEnergyExchangeBox const,
             T_ChargeStateDataBox const,
             T_AtomicStateDataBox const,
             T_IPDIonizationStateDataBox const,
@@ -140,6 +144,7 @@ namespace picongpu::particles::atomicPhysics::ionizationPotentialDepression::ker
             typename T_KernelState,
             typename T_LocalTimeRemainingBox,
             typename T_FoundUnboundIonBox,
+            typename T_AtomicEnergyExchangeBox,
             typename T_AtomicStateDataBox,
             typename T_ChargeStateDataBox,
             typename T_IPDIonizationStateDataBox,
@@ -153,6 +158,7 @@ namespace picongpu::particles::atomicPhysics::ionizationPotentialDepression::ker
             pmacc::DataSpace<picongpu::simDim> const superCellFieldIndex,
             T_LocalTimeRemainingBox const,
             T_FoundUnboundIonBox const,
+            T_AtomicEnergyExchangeBox atomicEnergyExchangeBox,
             T_ChargeStateDataBox const chargeStateBox,
             T_AtomicStateDataBox const atomicStateBox,
             T_IPDIonizationStateDataBox const ipdIonizationStateBox,
@@ -224,6 +230,12 @@ namespace picongpu::particles::atomicPhysics::ionizationPotentialDepression::ker
              */
             if(stateIsUnbound)
             {
+                auto& atomicEnergyExchange = atomicEnergyExchangeBox(superCellFieldIndex);
+                atomicEnergyExchange.template addAtomicEnergy<s_enums::ProcessClass::ipdIonization>(
+                    worker,
+                    static_cast<float_64>(ionizationEnergyToIPDIonizationState)
+                        * static_cast<float_64>(ion[weighting_]));
+
                 /* we only update the atomic state since IPD-Ionization is not a regular transition and does not use
                  *   shared resources */
 
@@ -259,6 +271,7 @@ namespace picongpu::particles::atomicPhysics::ionizationPotentialDepression::ker
             typename T_KernelState,
             typename T_LocalTimeRemainingBox,
             typename T_FoundUnboundIonBox,
+            typename T_AtomicEnergyExchangeBox,
             typename T_ChargeStateDataBox,
             typename T_AtomicStateDataBox,
             typename T_IPDIonizationStateDataBox,
@@ -270,6 +283,7 @@ namespace picongpu::particles::atomicPhysics::ionizationPotentialDepression::ker
             pmacc::DataSpace<picongpu::simDim> const superCellFieldIndex,
             T_LocalTimeRemainingBox const,
             T_FoundUnboundIonBox foundUnboundIonBox,
+            T_AtomicEnergyExchangeBox const,
             T_ChargeStateDataBox const,
             T_AtomicStateDataBox const,
             T_IPDIonizationStateDataBox const,

@@ -30,6 +30,7 @@
 #include "picongpu/particles/atomicPhysics/localHelperFields/SharedResourcesOverSubscribedField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/TimeRemainingField.hpp"
 #include "picongpu/particles/atomicPhysics/localHelperFields/TimeStepField.hpp"
+#include "picongpu/particles/atomicPhysics/stage/CreateAtomicEnergyExchangeField.hpp"
 #include "picongpu/particles/atomicPhysics/stage/CreateRateCacheField.hpp"
 #include "picongpu/particles/param.hpp"
 
@@ -61,6 +62,13 @@ namespace picongpu::particles::atomicPhysics
                 particles::atomicPhysics::stage::CreateRateCacheField<boost::mpl::_1>>
                 ForEachIonSpeciesCreateRateCacheField;
             ForEachIonSpeciesCreateRateCacheField(dataConnector, mappingDesc);
+
+            // persistent process-resolved atomic-energy and radiation ledger
+            pmacc::meta::ForEach<
+                ListAtomicPhysicsSpecies,
+                particles::atomicPhysics::stage::CreateAtomicEnergyExchangeField<boost::mpl::_1>>
+                ForEachIonSpeciesCreateAtomicEnergyExchangeField;
+            ForEachIonSpeciesCreateAtomicEnergyExchangeField(dataConnector, mappingDesc);
 
             // local time remaining field
             auto superCellTimeRemainingField

@@ -6,6 +6,7 @@ Plugins
 ==================================================================================== =================================================================================
 Plugin name                                                                          short description
 ==================================================================================== =================================================================================
+:ref:`atomic energy <usage-plugins-atomicEnergy>`                                     absolute and process-resolved atomic internal energy and escaped radiation
 :ref:`binning <usage-plugins-binningPlugin>` [#f2]_ [#f6]_                           particle binning plugin to make histograms with user-defined axes and quantity
 :ref:`charge conservation <usage-plugins-chargeConservation>` [#f5]_                 maximum difference between electron charge density and div E
 :ref:`checkpoint <usage-plugins-checkpoint>` [#f2]_                                  stores the primary data of the simulation for restarts.

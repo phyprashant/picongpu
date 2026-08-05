@@ -76,6 +76,7 @@ namespace picongpu::particles::atomicPhysics::kernel
             typename T_LocalElectronHistogramDataBox,
             typename T_AtomicStateDataBox,
             typename T_TransitionDataBox,
+            typename T_AtomicEnergyExchangeBox,
             typename... T_ChargeStateBoxAndIPDInput>
         HDINLINE void operator()(
             T_Worker const& worker,
@@ -85,6 +86,7 @@ namespace picongpu::particles::atomicPhysics::kernel
             T_LocalElectronHistogramDataBox electronHistogramDataBox,
             T_AtomicStateDataBox const atomicStateBox,
             T_TransitionDataBox const transitionBox,
+            T_AtomicEnergyExchangeBox atomicEnergyExchangeBox,
             T_ChargeStateBoxAndIPDInput... chargeStateBoxAndIPDInput) const
         {
             PMACC_CASSERT(
@@ -114,15 +116,32 @@ namespace picongpu::particles::atomicPhysics::kernel
 
             // get histogram for current superCell
             [[maybe_unused]] Histogram& electronHistogram = electronHistogramDataBox(superCellFieldIdx);
+            auto& atomicEnergyExchange = atomicEnergyExchangeBox(superCellFieldIdx);
+
+            //! spontaneous deexcitation is the only process of this kernel emitting an escaping photon
+            constexpr bool isRadiative = (u8(T_ProcessClass) == u8(s_enums::ProcessClass::spontaneousDeexcitation));
 
             // eV
             PMACC_SMEM(worker, superCellConstantIPDInput, typename T_IPDModel::SuperCellConstantInput);
 
+            /* block wide accumulators of the atomic energy ledger, weighted eV
+             *
+             * accumulated per worker thread and reduced once per block, see AtomicEnergyExchange */
+            PMACC_SMEM(worker, sharedAtomicEnergy, float_64);
+            PMACC_SMEM(worker, sharedRadiatedEnergy, float_64);
+
             auto onlyMaster = lockstep::makeMaster(worker);
             onlyMaster(
-                [&superCellConstantIPDInput, &superCellFieldIdx, &chargeStateBoxAndIPDInput...]()
+                [&superCellConstantIPDInput,
+                 &sharedAtomicEnergy,
+                 &sharedRadiatedEnergy,
+                 &superCellFieldIdx,
+                 &chargeStateBoxAndIPDInput...]()
                 {
-                    if constexpr(isIonizing && isCollisional)
+                    sharedAtomicEnergy = 0.0;
+                    sharedRadiatedEnergy = 0.0;
+
+                    if constexpr(isIonizing)
                     {
                         superCellConstantIPDInput
                             = ionizationPotentialDepression::PassIPDInputs::template getSuperCellConstantInput<
@@ -131,8 +150,14 @@ namespace picongpu::particles::atomicPhysics::kernel
                 });
             worker.sync();
 
+            // weighted eV, private to this worker thread
+            float_64 threadAtomicEnergy = 0.0;
+            [[maybe_unused]] float_64 threadRadiatedEnergy = 0.0;
+
             forEachLocalIonBoxEntry(
                 [&electronHistogram,
+                 &threadAtomicEnergy,
+                 &threadRadiatedEnergy,
                  &atomicStateBox,
                  &transitionBox,
                  &superCellConstantIPDInput,
@@ -150,9 +175,9 @@ namespace picongpu::particles::atomicPhysics::kernel
 
                     uint32_t const transitionIndex = ion[transitionIndex_];
 
-                    // get delta Energy transition
-                    [[maybe_unused]] float_X deltaEnergy = 0._X;
-                    if constexpr(isCollisional && isIonizing)
+                    // positive energy difference between the upper and lower atomic states, eV
+                    float_X transitionEnergy = 0._X;
+                    if constexpr(isIonizing)
                     {
                         // eV
                         float_X const ionizationPotentialDepression
@@ -161,16 +186,16 @@ namespace picongpu::particles::atomicPhysics::kernel
                                 ion[atomicStateCollectionIndex_],
                                 superCellConstantIPDInput);
 
-                        deltaEnergy = picongpu::particles::atomicPhysics::DeltaEnergyTransition::get(
+                        transitionEnergy = picongpu::particles::atomicPhysics::DeltaEnergyTransition::get(
                             transitionIndex,
                             atomicStateBox,
                             transitionBox,
                             ionizationPotentialDepression,
                             chargeStateBoxAndIPDInput...);
                     }
-                    if constexpr(isCollisional && !isIonizing)
+                    else
                     {
-                        deltaEnergy = picongpu::particles::atomicPhysics::DeltaEnergyTransition::get(
+                        transitionEnergy = picongpu::particles::atomicPhysics::DeltaEnergyTransition::get(
                             transitionIndex,
                             atomicStateBox,
                             transitionBox);
@@ -179,9 +204,6 @@ namespace picongpu::particles::atomicPhysics::kernel
                     uint32_t newAtomicStateCollectionIndex;
                     if constexpr(isUpward)
                     {
-                        if constexpr(isCollisional)
-                            deltaEnergy = -deltaEnergy;
-
                         // new state is upper state of transition
                         newAtomicStateCollectionIndex = transitionBox.upperStateCollectionIndex(transitionIndex);
                     }
@@ -197,14 +219,64 @@ namespace picongpu::particles::atomicPhysics::kernel
                         ion,
                         newAtomicStateCollectionIndex);
 
-                    // no energy accounting if using fixed matrix
+                    /* no energy accounting if using fixed matrix
+                     *
+                     * @attention the atomic energy ledger below must stay on this side of the early return, so
+                     *  that it only ever records exchanges whose counterpart (histogram, radiation) also
+                     *  happened */
                     if constexpr(picongpu::atomicPhysics::debug::fixedRateMatrix::
                                      USE_FIXED_RATE_INSTEAD_OF_RATE_CALCULATION)
                         return;
 
-                    // record used energy. The histogram stores weighted electron-energy changes.
+                    float_64 const weightedTransitionEnergy
+                        = static_cast<float_64>(transitionEnergy) * static_cast<float_64>(ion[weighting_]);
+                    threadAtomicEnergy += isUpward ? weightedTransitionEnergy : -weightedTransitionEnergy;
+
+                    if constexpr(isRadiative)
+                        threadRadiatedEnergy += weightedTransitionEnergy;
+
+                    /* record used energy
+                     *
+                     * @attention deltaEnergy is the energy of ONE physical ion, while the histogram's
+                     *  binDeltaEnergy is a WEIGHTED quantity -- DecelerateElectrons divides it by the bin's
+                     *  surviving weight to recover the per physical electron energy shift. The macro ion
+                     *  stands for ion[weighting_] physical ions, so the energy must be scaled by the weight
+                     *  before being handed to the histogram, exactly as the three-body recombination
+                     *  specialization below and the field ionization branch of RecordSuggestedChanges do. */
                     if constexpr(isCollisional)
-                        electronHistogram.addDeltaEnergy(worker, ion[binIndex_], deltaEnergy * ion[weighting_]);
+                    {
+                        float_X const electronDeltaEnergy = isUpward ? -transitionEnergy : transitionEnergy;
+                        electronHistogram.addDeltaEnergy(
+                            worker,
+                            ion[binIndex_],
+                            electronDeltaEnergy * ion[weighting_]);
+                    }
+                });
+
+            // reduce the ledger contributions of this block, one global atomic per block instead of per macro ion
+            alpaka::atomicAdd(
+                worker.getAcc(),
+                &sharedAtomicEnergy,
+                threadAtomicEnergy,
+                ::alpaka::hierarchy::Threads{});
+            if constexpr(isRadiative)
+                alpaka::atomicAdd(
+                    worker.getAcc(),
+                    &sharedRadiatedEnergy,
+                    threadRadiatedEnergy,
+                    ::alpaka::hierarchy::Threads{});
+            worker.sync();
+
+            onlyMaster(
+                [&worker, &atomicEnergyExchange, &sharedAtomicEnergy, &sharedRadiatedEnergy]()
+                {
+                    atomicEnergyExchange.template addAtomicEnergyBlockWide<T_ProcessClass>(
+                        worker,
+                        sharedAtomicEnergy);
+                    if constexpr(isRadiative)
+                        atomicEnergyExchange.template addRadiatedEnergyBlockWide<T_ProcessClass>(
+                            worker,
+                            sharedRadiatedEnergy);
                 });
         }
     };
@@ -252,6 +324,7 @@ namespace picongpu::particles::atomicPhysics::kernel
             typename T_AtomicStateDataBox,
             typename T_TransitionDataBox,
             typename T_LocalCapturedWeightCacheBox,
+            typename T_AtomicEnergyExchangeBox,
             typename... T_ChargeStateBoxAndIPDInput>
         HDINLINE void operator()(
             T_Worker const& worker,
@@ -262,6 +335,7 @@ namespace picongpu::particles::atomicPhysics::kernel
             T_AtomicStateDataBox const atomicStateBox,
             T_TransitionDataBox const transitionBox,
             T_LocalCapturedWeightCacheBox capturedWeightCacheBox,
+            T_AtomicEnergyExchangeBox atomicEnergyExchangeBox,
             T_ChargeStateBoxAndIPDInput... chargeStateBoxAndIPDInput) const
         {
             PMACC_CASSERT(
@@ -286,23 +360,36 @@ namespace picongpu::particles::atomicPhysics::kernel
             // get histogram and captured weight cache for current superCell
             Histogram& electronHistogram = electronHistogramDataBox(superCellFieldIdx);
             auto& capturedWeightCache = capturedWeightCacheBox(superCellFieldIdx);
+            auto& atomicEnergyExchange = atomicEnergyExchangeBox(superCellFieldIdx);
 
             // eV
             PMACC_SMEM(worker, superCellConstantIPDInput, typename T_IPDModel::SuperCellConstantInput);
 
+            //! weighted eV, block wide accumulator of the atomic energy ledger
+            PMACC_SMEM(worker, sharedAtomicEnergy, float_64);
+
             auto onlyMaster = lockstep::makeMaster(worker);
             onlyMaster(
-                [&superCellConstantIPDInput, &superCellFieldIdx, &chargeStateBoxAndIPDInput...]()
+                [&superCellConstantIPDInput,
+                 &sharedAtomicEnergy,
+                 &superCellFieldIdx,
+                 &chargeStateBoxAndIPDInput...]()
                 {
+                    sharedAtomicEnergy = 0.0;
+
                     superCellConstantIPDInput
                         = ionizationPotentialDepression::PassIPDInputs::template getSuperCellConstantInput<
                             T_IPDModel>(superCellFieldIdx, chargeStateBoxAndIPDInput...);
                 });
             worker.sync();
 
+            // weighted eV, private to this worker thread
+            float_64 threadAtomicEnergy = 0.0;
+
             forEachLocalIonBoxEntry(
                 [&electronHistogram,
                  &capturedWeightCache,
+                 &threadAtomicEnergy,
                  &atomicStateBox,
                  &transitionBox,
                  &superCellConstantIPDInput,
@@ -346,13 +433,18 @@ namespace picongpu::particles::atomicPhysics::kernel
                         ion,
                         newAtomicStateCollectionIndex);
 
-                    // no energy accounting or electron capture if using fixed matrix
+                    /* no energy accounting or electron capture if using fixed matrix
+                     *
+                     * @attention the atomic energy ledger below must stay on this side of the early return, so
+                     *  that it only ever records exchanges whose counterpart also happened */
                     if constexpr(picongpu::atomicPhysics::debug::fixedRateMatrix::
                                      USE_FIXED_RATE_INSTEAD_OF_RATE_CALCULATION)
                         return;
 
                     uint32_t const binIndex = ion[binIndex_];
                     float_X const weight = ion[weighting_];
+
+                    threadAtomicEnergy -= static_cast<float_64>(deltaEnergy) * static_cast<float_64>(weight);
 
                     /* released binding energy and the captured electron's kinetic energy are transferred to the
                      *  remaining free electrons, eV weighted */
@@ -363,6 +455,21 @@ namespace picongpu::particles::atomicPhysics::kernel
 
                     // record captured weight for the electron capture sub-stage
                     capturedWeightCache.add(worker, binIndex, weight);
+                });
+
+            // reduce the ledger contributions of this block, one global atomic per block instead of per macro ion
+            alpaka::atomicAdd(
+                worker.getAcc(),
+                &sharedAtomicEnergy,
+                threadAtomicEnergy,
+                ::alpaka::hierarchy::Threads{});
+            worker.sync();
+
+            onlyMaster(
+                [&worker, &atomicEnergyExchange, &sharedAtomicEnergy]()
+                {
+                    atomicEnergyExchange.template addAtomicEnergyBlockWide<
+                        s_enums::ProcessClass::threeBodyRecombination>(worker, sharedAtomicEnergy);
                 });
         }
     };
@@ -399,17 +506,23 @@ namespace picongpu::particles::atomicPhysics::kernel
             typename T_AreaMapping,
             typename T_LocalTimeRemainingBox,
             typename T_IonBox,
+            typename T_LocalElectronHistogramDataBox,
             typename T_AtomicStateDataBox,
             typename T_TransitionDataBox,
-            typename T_LocalCapturedWeightCacheBox>
+            typename T_LocalCapturedWeightCacheBox,
+            typename T_AtomicEnergyExchangeBox,
+            typename... T_ChargeStateBoxAndIPDInput>
         HDINLINE void operator()(
             T_Worker const& worker,
             T_AreaMapping const areaMapping,
             T_LocalTimeRemainingBox const timeRemainingBox,
             T_IonBox ionBox,
+            T_LocalElectronHistogramDataBox electronHistogramDataBox,
             T_AtomicStateDataBox const atomicStateBox,
             T_TransitionDataBox const transitionBox,
-            T_LocalCapturedWeightCacheBox capturedWeightCacheBox) const
+            T_LocalCapturedWeightCacheBox capturedWeightCacheBox,
+            T_AtomicEnergyExchangeBox atomicEnergyExchangeBox,
+            T_ChargeStateBoxAndIPDInput... chargeStateBoxAndIPDInput) const
         {
             PMACC_CASSERT(
                 CheckSetOfAtomicDataBoxes::transitionDataBoxMatchesProcessClass<
@@ -428,10 +541,46 @@ namespace picongpu::particles::atomicPhysics::kernel
             if(superCellAlreadyFinished || !superCellHasIons)
                 return;
 
+            auto& electronHistogram = electronHistogramDataBox(superCellFieldIdx);
             auto& capturedWeightCache = capturedWeightCacheBox(superCellFieldIdx);
+            auto& atomicEnergyExchange = atomicEnergyExchangeBox(superCellFieldIdx);
+
+            PMACC_SMEM(worker, superCellConstantIPDInput, typename T_IPDModel::SuperCellConstantInput);
+
+            //! weighted eV, block wide accumulators of the atomic energy ledger
+            PMACC_SMEM(worker, sharedAtomicEnergy, float_64);
+            PMACC_SMEM(worker, sharedRadiatedEnergy, float_64);
+
+            auto onlyMaster = lockstep::makeMaster(worker);
+            onlyMaster(
+                [&superCellConstantIPDInput,
+                 &sharedAtomicEnergy,
+                 &sharedRadiatedEnergy,
+                 &superCellFieldIdx,
+                 &chargeStateBoxAndIPDInput...]()
+                {
+                    sharedAtomicEnergy = 0.0;
+                    sharedRadiatedEnergy = 0.0;
+
+                    superCellConstantIPDInput
+                        = ionizationPotentialDepression::PassIPDInputs::template getSuperCellConstantInput<
+                            T_IPDModel>(superCellFieldIdx, chargeStateBoxAndIPDInput...);
+                });
+            worker.sync();
+
+            // weighted eV, private to this worker thread
+            float_64 threadAtomicEnergy = 0.0;
+            float_64 threadRadiatedEnergy = 0.0;
 
             forEachLocalIonBoxEntry(
-                [&capturedWeightCache, &atomicStateBox, &transitionBox](T_Worker const& worker, auto& ion)
+                [&electronHistogram,
+                 &capturedWeightCache,
+                 &threadAtomicEnergy,
+                 &threadRadiatedEnergy,
+                 &atomicStateBox,
+                 &transitionBox,
+                 &superCellConstantIPDInput,
+                 &chargeStateBoxAndIPDInput...](T_Worker const& worker, auto& ion)
                 {
                     if constexpr(picongpu::atomicPhysics::debug::kernel::recordChanges::CHECK_FOR_ACCEPTANCE)
                         if(!ion[accepted_])
@@ -445,6 +594,22 @@ namespace picongpu::particles::atomicPhysics::kernel
 
                     uint32_t const transitionIndex = ion[transitionIndex_];
 
+                    float_X const ionizationPotentialDepression
+                        = ionizationPotentialDepression::template getBoundFreeLowerStateIPD<T_IPDModel>(
+                            atomicStateBox,
+                            transitionBox,
+                            transitionIndex,
+                            superCellConstantIPDInput);
+
+                    float_X const transitionEnergy = DeltaEnergyTransition::get(
+                        transitionIndex,
+                        atomicStateBox,
+                        transitionBox,
+                        ionizationPotentialDepression,
+                        chargeStateBoxAndIPDInput...);
+                    float_64 const weight = static_cast<float_64>(ion[weighting_]);
+                    uint32_t const binIndex = ion[binIndex_];
+
                     // downward process, new state is lower state of transition
                     uint32_t const newAtomicStateCollectionIndex
                         = transitionBox.lowerStateCollectionIndex(transitionIndex);
@@ -455,13 +620,48 @@ namespace picongpu::particles::atomicPhysics::kernel
                         ion,
                         newAtomicStateCollectionIndex);
 
-                    // no electron capture if using fixed matrix
+                    /* no electron capture if using fixed matrix
+                     *
+                     * @attention the atomic energy ledger below must stay on this side of the early return, so
+                     *  that it only ever records exchanges whose counterpart (the electron capture) also
+                     *  happened */
                     if constexpr(picongpu::atomicPhysics::debug::fixedRateMatrix::
                                      USE_FIXED_RATE_INSTEAD_OF_RATE_CALCULATION)
                         return;
 
+                    threadAtomicEnergy -= static_cast<float_64>(transitionEnergy) * weight;
+
+                    /* the emitted photon carries the released binding energy plus the captured electron's kinetic
+                     *  energy out of the simulation, eV weighted */
+                    threadRadiatedEnergy
+                        += (static_cast<float_64>(transitionEnergy)
+                            + static_cast<float_64>(electronHistogram.getBinEnergy(binIndex)))
+                        * weight;
+
                     // record captured weight for the electron capture sub-stage
-                    capturedWeightCache.add(worker, ion[binIndex_], ion[weighting_]);
+                    capturedWeightCache.add(worker, binIndex, ion[weighting_]);
+                });
+
+            // reduce the ledger contributions of this block, one global atomic per block instead of per macro ion
+            alpaka::atomicAdd(
+                worker.getAcc(),
+                &sharedAtomicEnergy,
+                threadAtomicEnergy,
+                ::alpaka::hierarchy::Threads{});
+            alpaka::atomicAdd(
+                worker.getAcc(),
+                &sharedRadiatedEnergy,
+                threadRadiatedEnergy,
+                ::alpaka::hierarchy::Threads{});
+            worker.sync();
+
+            onlyMaster(
+                [&worker, &atomicEnergyExchange, &sharedAtomicEnergy, &sharedRadiatedEnergy]()
+                {
+                    atomicEnergyExchange.template addAtomicEnergyBlockWide<
+                        s_enums::ProcessClass::radiativeRecombination>(worker, sharedAtomicEnergy);
+                    atomicEnergyExchange.template addRadiatedEnergyBlockWide<
+                        s_enums::ProcessClass::radiativeRecombination>(worker, sharedRadiatedEnergy);
                 });
         }
     };

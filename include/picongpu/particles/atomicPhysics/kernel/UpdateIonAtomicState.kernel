@@ -22,12 +22,16 @@
 #include "picongpu/defines.hpp"
 #include "picongpu/particles/atomicPhysics/CheckSetOfAtomicDataBoxes.hpp"
 #include "picongpu/particles/atomicPhysics/ConvertEnum.hpp"
+#include "picongpu/particles/atomicPhysics/DeltaEnergyTransition.hpp"
 #include "picongpu/particles/atomicPhysics/KernelIndexation.hpp"
 #include "picongpu/particles/atomicPhysics/SetAtomicState.hpp"
 #include "picongpu/particles/atomicPhysics/enums/ProcessClass.hpp"
 #include "picongpu/particles/atomicPhysics/enums/TransitionDirection.hpp"
+#include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/GetIPD.hpp"
 #include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/PassIPDInputs.hpp"
 
+#include <pmacc/lockstep.hpp>
+#include <pmacc/memory/shared/Allocate.hpp>
 #include <pmacc/particles/algorithm/ForEach.hpp>
 #include <pmacc/static_assert.hpp>
 
@@ -43,7 +47,7 @@ namespace picongpu::particles::atomicPhysics::kernel
      * @note This kernel differs from the RecordChanges kernel by not assuming that all ions accepted a transition.
      * @note This kernel is intended for updating the ion atomic state after accepting an instant transition.
      */
-    template<s_enums::ProcessClass T_ProcessClass>
+    template<s_enums::ProcessClass T_ProcessClass, typename T_IPDModel>
     struct UpdateIonAtomicStateKernel
     {
         using VectorIdx = pmacc::DataSpace<picongpu::simDim>;
@@ -66,14 +70,18 @@ namespace picongpu::particles::atomicPhysics::kernel
             typename T_LocalTimeRemainingBox,
             typename T_IonBox,
             typename T_AtomicStateDataBox,
-            typename T_TransitionDataBox>
+            typename T_TransitionDataBox,
+            typename T_AtomicEnergyExchangeBox,
+            typename... T_ChargeStateBoxAndIPDInput>
         HDINLINE void operator()(
             T_Worker const& worker,
             T_AreaMapping const areaMapping,
             T_LocalTimeRemainingBox const timeRemainingBox,
             T_IonBox ionBox,
             T_AtomicStateDataBox const atomicStateBox,
-            T_TransitionDataBox const transitionBox) const
+            T_TransitionDataBox const transitionBox,
+            T_AtomicEnergyExchangeBox atomicEnergyExchangeBox,
+            T_ChargeStateBoxAndIPDInput... chargeStateBoxAndIPDInput) const
         {
             PMACC_CASSERT(
                 CheckSetOfAtomicDataBoxes::
@@ -91,8 +99,37 @@ namespace picongpu::particles::atomicPhysics::kernel
             if(superCellAlreadyFinished || !superCellHasIons)
                 return;
 
+            auto& atomicEnergyExchange = atomicEnergyExchangeBox(superCellFieldIdx);
+
+            PMACC_SMEM(worker, superCellConstantIPDInput, typename T_IPDModel::SuperCellConstantInput);
+
+            //! weighted eV, block wide accumulator of the atomic energy ledger
+            PMACC_SMEM(worker, sharedAtomicEnergy, float_64);
+
+            auto onlyMaster = lockstep::makeMaster(worker);
+            onlyMaster(
+                [&superCellConstantIPDInput,
+                 &sharedAtomicEnergy,
+                 &superCellFieldIdx,
+                 &chargeStateBoxAndIPDInput...]()
+                {
+                    sharedAtomicEnergy = 0.0;
+
+                    superCellConstantIPDInput
+                        = ionizationPotentialDepression::PassIPDInputs::template getSuperCellConstantInput<
+                            T_IPDModel>(superCellFieldIdx, chargeStateBoxAndIPDInput...);
+                });
+            worker.sync();
+
+            // weighted eV, private to this worker thread
+            float_64 threadAtomicEnergy = 0.0;
+
             forEachLocalIonBoxEntry(
-                [&atomicStateBox, &transitionBox](T_Worker const& worker, auto& ion)
+                [&threadAtomicEnergy,
+                 &atomicStateBox,
+                 &transitionBox,
+                 &superCellConstantIPDInput,
+                 &chargeStateBoxAndIPDInput...]([[maybe_unused]] T_Worker const& worker, auto& ion)
                 {
                     bool const accepted = ion[accepted_];
                     uint32_t const transitionIndex = ion[transitionIndex_];
@@ -104,6 +141,20 @@ namespace picongpu::particles::atomicPhysics::kernel
                     if(!accepted || !acceptedProcessClassTransition)
                         return;
 
+                    float_X const ionizationPotentialDepression
+                        = ionizationPotentialDepression::template getIPD<T_IPDModel>(
+                            atomicStateBox,
+                            ion[atomicStateCollectionIndex_],
+                            superCellConstantIPDInput);
+                    float_X const transitionEnergy = DeltaEnergyTransition::get(
+                        transitionIndex,
+                        atomicStateBox,
+                        transitionBox,
+                        ionizationPotentialDepression,
+                        chargeStateBoxAndIPDInput...);
+                    threadAtomicEnergy
+                        += static_cast<float_64>(transitionEnergy) * static_cast<float_64>(ion[weighting_]);
+
                     uint32_t const newAtomicStateCollectionIndex
                         = transitionBox.upperStateCollectionIndex(transitionIndex);
 
@@ -111,6 +162,21 @@ namespace picongpu::particles::atomicPhysics::kernel
                         atomicStateBox,
                         ion,
                         newAtomicStateCollectionIndex);
+                });
+
+            // reduce the ledger contributions of this block, one global atomic per block instead of per macro ion
+            alpaka::atomicAdd(
+                worker.getAcc(),
+                &sharedAtomicEnergy,
+                threadAtomicEnergy,
+                ::alpaka::hierarchy::Threads{});
+            worker.sync();
+
+            onlyMaster(
+                [&worker, &atomicEnergyExchange, &sharedAtomicEnergy]() {
+                    atomicEnergyExchange.template addAtomicEnergyBlockWide<T_ProcessClass>(
+                        worker,
+                        sharedAtomicEnergy);
                 });
         }
     };
