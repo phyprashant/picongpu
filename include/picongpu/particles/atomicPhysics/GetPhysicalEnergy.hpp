@@ -72,5 +72,42 @@ namespace picongpu::particles::atomicPhysics
             // eV
             return energy * eV;
         }
+
+        /** kinetic energy of one physical particle, double precision and cancellation free
+         *
+         * The float_X version above evaluates sqrt(m^2 + p^2) - m directly. For a non
+         * relativistic particle p^2 << m^2, so that subtracts two nearly equal numbers and
+         * throws away most of the mantissa: at 10 eV, p^2/m^2 ~ 4e-5, leaving roughly two
+         * significant digits in single precision. DecelerateElectrons round trips
+         * energy -> momentum -> energy once per sub-step, so that error compounds.
+         *
+         * Uses the equivalent form p^2 / (sqrt(m^2 + p^2) + m), which never subtracts
+         * comparable quantities, evaluated in float_64.
+         *
+         * @return [eV]
+         */
+        template<typename T_Particle>
+        HDINLINE static float_64 KineticEnergyF64(T_Particle const& particle)
+        {
+            constexpr float_64 conversionFactor
+                = (picongpu::sim.unit.length() * picongpu::sim.unit.length())
+                / (picongpu::sim.unit.time() * picongpu::sim.unit.time() * picongpu::sim.si.getSpeedOfLight()
+                   * picongpu::sim.si.getSpeedOfLight());
+
+            float_64 const m
+                = static_cast<float_64>(picongpu::traits::frame::getMass<typename T_Particle::FrameType>());
+            float_64 const weighting = static_cast<float_64>(particle[weighting_]);
+            float_64 const momentumSquared
+                = static_cast<float_64>(pmacc::math::l2norm2(particle[momentum_])) / (weighting * weighting)
+                * conversionFactor;
+
+            // p^2 / (sqrt(m^2 + p^2) + m) == sqrt(m^2 + p^2) - m, without the cancellation
+            float_64 const energy = momentumSquared / (math::sqrt(m * m + momentumSquared) + m);
+
+            constexpr float_64 eV = sim.si.conv().joule2eV(
+                picongpu::sim.unit.mass() * picongpu::sim.si.getSpeedOfLight() * picongpu::sim.si.getSpeedOfLight());
+
+            return energy * eV;
+        }
     };
 } // namespace picongpu::particles::atomicPhysics

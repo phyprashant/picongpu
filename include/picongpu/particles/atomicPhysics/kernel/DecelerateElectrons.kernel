@@ -101,10 +101,15 @@ namespace picongpu::particles::atomicPhysics::kernel
             forEachLocalElectronBoxEntry(
                 [&histogram, &capturedWeightCache](T_Worker const& worker, auto& electron)
                 {
-                    // energy of a single corresponding physical electron,
-                    //      no need to use float_64 since really high energy electrons are
-                    //      suppressed in atomicPhysics
-                    float_X const energyElectron = GetPhysicalEnergy::KineticEnergy(electron);
+                    /* energy of a single corresponding physical electron
+                     *
+                     * float_64 throughout: this kernel round trips energy -> momentum -> energy once
+                     * per atomicPhysics sub-step, and in float_X the round trip error dwarfs the per
+                     * sub-step energy change for cold electrons. The float_X copy is only used to
+                     * pick the histogram bin, where two digits are plenty.
+                     */
+                    float_64 const energyElectron64 = GetPhysicalEnergy::KineticEnergyF64(electron);
+                    float_X const energyElectron = static_cast<float_X>(energyElectron64);
                     // eV
 
                     // no corresponding bin exist
@@ -129,36 +134,37 @@ namespace picongpu::particles::atomicPhysics::kernel
 
                     // m_internal * kg/m_internal * m^2/s^2 * eV/J = kg * m^2/s^2 * eV/ J
                     //  = Nm/J * eV = J/J * eV = eV, ~ 511e3 eV
-                    float_X const mcSquaredElectron = static_cast<float_X>(
-                        static_cast<float_64>(picongpu::traits::frame::getMass<typename T_Electron::FrameType>())
+                    float_64 const mcSquaredElectron
+                        = static_cast<float_64>(picongpu::traits::frame::getMass<typename T_Electron::FrameType>())
                         * sim.si.conv().joule2eV(
-                            sim.unit.mass() * pmacc::math::cPow(picongpu::sim.si.getSpeedOfLight(), 2u)));
+                            sim.unit.mass() * pmacc::math::cPow(picongpu::sim.si.getSpeedOfLight(), 2u));
                     // eV, not weighted
 
                     // distribute energy change as mean by weight on all surviving electrons in bin
                     // eV + eV /(unitless * unitless) = eV
-                    float_X newEnergyElectron
-                        = energyElectron + static_cast<float_X>(deltaEnergyBin / survivingWeightBin);
+                    float_64 newEnergyElectron = energyElectron64
+                        + static_cast<float_64>(deltaEnergyBin) / static_cast<float_64>(survivingWeightBin);
                     // (eV, not weighted) + ((eV, weighted)/weight)
                     //  = (eV, not weighted) + (eV, not weighted) = (eV, weighted)
                     // eV, not weighted
 
                     // case: too much energy removed
-                    if(newEnergyElectron < 0._X)
-                        newEnergyElectron = 0._X; // extract as much as possible, rest is hopefully negligible
+                    if(newEnergyElectron < 0.0)
+                        newEnergyElectron = 0.0; // extract as much as possible, rest is hopefully negligible
 
-                    constexpr float_X c_internal = static_cast<float_X>(
-                        picongpu::sim.si.getSpeedOfLight() * sim.unit.time() / sim.unit.length());
+                    constexpr float_64 c_internal
+                        = picongpu::sim.si.getSpeedOfLight() * sim.unit.time() / sim.unit.length();
                     // usually ~1, internal units
 
-                    constexpr float_X conversionEnergy = static_cast<float_X>(picongpu::sim.pic.get_eV());
+                    constexpr float_64 conversionEnergy = static_cast<float_64>(picongpu::sim.pic.get_eV());
                     // J/(eV) * sim.unit.energy()/J  = J/J * sim.unit.energy()/(eV)
 
-                    constexpr float_X scalingFactor = 1._X / c_internal * conversionEnergy;
+                    constexpr float_64 scalingFactor = 1.0 / c_internal * conversionEnergy;
 
                     // sqrt(E' * (E' + 2* m*c^2)) / c
-                    float_X const newElectronMomentum
-                        = math::sqrt(newEnergyElectron * (newEnergyElectron + 2 * mcSquaredElectron)) * scalingFactor;
+                    float_64 const newElectronMomentum
+                        = math::sqrt(newEnergyElectron * (newEnergyElectron + 2.0 * mcSquaredElectron))
+                        * scalingFactor;
                     // AU = sim.atomicUnit.energy()
                     // sqrt(eV * (eV + eV))/(sim.unit.length()/sim.unit.time()) * (sim.unit.energy()/eV)
                     //  = sqrt((eV)^2)/(eV) * sim.unit.time()/sim.unit.length() * sim.unit.energy()
@@ -166,17 +172,22 @@ namespace picongpu::particles::atomicPhysics::kernel
                     //  = sim.unit.mass() * sim.unit.length()/sim.unit.time()
                     // internal units, not weighted
 
-                    float_X previousMomentumVectorLength = pmacc::math::l2norm(electron[momentum_]);
+                    float_64 previousMomentumVectorLength
+                        = static_cast<float_64>(pmacc::math::l2norm(electron[momentum_]));
                     // internal units, scaled
 
                     // case: not moving electron, --> no need to resize vector
-                    if(previousMomentumVectorLength == 0._X)
-                        previousMomentumVectorLength = 1._X;
+                    if(previousMomentumVectorLength == 0.0)
+                        previousMomentumVectorLength = 1.0;
 
                     // if previous momentum == 0, discards electron
                     // sim.unit.mass() * sim.unit.length() / sim.unit.time(), weighted
-                    electron[momentum_]
-                        *= newElectronMomentum * electron[weighting_] * 1._X / previousMomentumVectorLength;
+                    /* only the rescale ratio needs the precision; the stored momentum stays float_X,
+                     *  whose 1e-7 relative resolution is far finer than the ~1e-5 relative change one
+                     *  sub-step applies */
+                    electron[momentum_] *= static_cast<float_X>(
+                        newElectronMomentum * static_cast<float_64>(electron[weighting_])
+                        / previousMomentumVectorLength);
                 });
         }
     };
