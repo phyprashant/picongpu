@@ -59,6 +59,16 @@ namespace picongpu::particles::atomicPhysics
      * @attention the scaling must be applied consistently everywhere the rates enter, i.e. both when filling the
      *  rate cache and when rolling a specific transition, otherwise the cumulative sums of the choose-transition
      *  kernels no longer normalize to their cached total.
+     *
+     * @attention both safety properties above assume both directions of a pair actually exist. If only one of
+     *  electronic ionization and three-body recombination is active there is no inverse to carry the matching
+     *  factor, nothing constrains the ratio, and the scaling becomes an uncompensated reduction of the surviving
+     *  direction rather than a stretched transient. The cap is therefore inactive unless both are enabled, see
+     *  stage/CapCollisionalBoundFreeRates.hpp.
+     *
+     * @note which direction triggers the cap is not fixed. For N2+ between 50 and 300 eV at 1e22 cm^-3 every
+     *  binding state was bound by its *ionization* rate, at up to 7x the limit, with three-body recombination
+     *  contributing under 1e-5 of the loss rate. This is not a three-body-recombination-only concern.
      */
     struct CollisionalBoundFreePairCap
     {

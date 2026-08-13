@@ -83,6 +83,9 @@ namespace picongpu::atomicPhysics
          *  See particles/atomicPhysics/CollisionalBoundFreePairCap.hpp for the model.
          *
          * @attention no effect unless a state actually exceeds the limit
+         * @attention no effect unless *both* electronic ionization and three-body recombination are active for
+         *  the species; with only one direction there is no inverse to carry the matching factor, so scaling
+         *  would change the physics instead of only the transient. It is skipped and reported once in that case.
          */
         static constexpr bool capCollisionalBoundFreePairRates = true;
     };

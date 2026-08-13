@@ -43,6 +43,7 @@
 #include <pmacc/particles/meta/FindByNameOrType.hpp>
 
 #include <cstdint>
+#include <iostream>
 #include <string>
 
 namespace picongpu::particles::atomicPhysics::stage
@@ -63,16 +64,56 @@ namespace picongpu::particles::atomicPhysics::stage
         // ionization potential depression model to use
         using IPDModel = picongpu::atomicPhysics::IPDModel;
 
+        /** tell the user once that the requested pair cap is not being applied
+         *
+         * Silently dropping a requested numerical scheme is worse than the scheme itself; without this a
+         *  single-direction setup would keep the un-capped sub-step cost with no indication why.
+         */
+        HINLINE static void reportPairCapInactive()
+        {
+            static bool alreadyReported = false;
+            if(alreadyReported)
+                return;
+            alreadyReported = true;
+
+            std::cout << "atomicPhysics: capCollisionalBoundFreePairRates is enabled but inactive for species "
+                      << IonSpecies::FrameType::getName()
+                      << ", it requires both electronic ionization and three-body recombination. Rates are"
+                         " un-capped and the sub-step count is unbounded."
+                      << std::endl;
+        }
+
         //! call of kernel for every superCell
         HINLINE void operator()(picongpu::MappingDesc const mappingDesc) const
         {
             using AtomicDataType = typename picongpu::traits::GetAtomicDataType<IonSpecies>::type;
 
-            //! nothing to cap unless at least one of the two collisional bound-free directions is active
+            /** the pair cap requires *both* collisional bound-free directions to be active
+             *
+             * Its correctness rests on scaling a transition's ionization and its detailed balance inverse by
+             *  the same factor, which leaves their ratio, and therefore the equilibrium the pair relaxes to,
+             *  exact. With only one direction compiled in there is no inverse to carry the matching factor,
+             *  so scaling the surviving direction is not a stretched transient but an uncompensated change of
+             *  how much ionization, or recombination, happens per PIC time step.
+             *
+             * This is not a hypothetical configuration. A state's collisional bound-free loss rate is
+             *  routinely dominated by its electronic ionization alone - measured at up to 7x the instant
+             *  transition rate limit for N2+ at 300 eV and 1e22 cm^-3, with three-body recombination
+             *  contributing under 1e-5 of it - so an ionization-only setup would be capped just as hard as
+             *  the full one, with nothing balancing it.
+             *
+             * @attention deliberately a silent no-op rather than a hard error: the cap defaults to enabled,
+             *  so a static_assert here would break every otherwise valid single-direction setup at compile
+             *  time. reportPairCapInactive() reports the decision once at runtime instead.
+             */
             if constexpr(!picongpu::particles::atomicPhysics::CollisionalBoundFreePairCap::enabled
                          || !(AtomicDataType::switchElectronicIonization
-                              || AtomicDataType::switchThreeBodyRecombination))
+                              && AtomicDataType::switchThreeBodyRecombination))
+            {
+                if constexpr(picongpu::particles::atomicPhysics::CollisionalBoundFreePairCap::enabled)
+                    reportPairCapInactive();
                 return;
+            }
             else
             {
                 // full local domain, no guards
