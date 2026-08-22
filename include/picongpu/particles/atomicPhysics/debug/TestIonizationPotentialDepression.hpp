@@ -33,6 +33,8 @@
 
 #include "picongpu/particles/atomicPhysics/ConvertEnum.hpp"
 #include "picongpu/particles/atomicPhysics/debug/TestRelativeError.hpp"
+
+#include <cmath>
 #include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/RelativisticTemperatureFunctor.hpp"
 #include "picongpu/particles/atomicPhysics/ionizationPotentialDepression/StewartPyattIPD.hpp"
 
@@ -85,9 +87,127 @@ namespace picongpu::particles::atomicPhysics::debug
                 1e-5);
         }
 
+        /** SCFLY-extended Stewart-Pyatt at a given temperature
+         *
+         * @param electronDensity 1/m^3
+         * @param temperatureTimesk_Boltzman eV, may be exactly 0
+         * @param chargeState charge state before ionization
+         * @return eV
+         */
+        static float_64 scflyExtendedIPD(
+            float_64 const electronDensity,
+            float_64 const temperatureTimesk_Boltzman,
+            uint8_t const chargeState)
+        {
+            float_64 const unit_length = static_cast<float_64>(sim.unit.length());
+            float_64 const densityPIC = electronDensity * (unit_length * unit_length * unit_length);
+
+            // UNIT_LENGTH; exactly 0 for T == 0, which is the case under test
+            float_64 const debyeLength = std::sqrt(
+                sim.pic.getEps0<float_64>() * sim.pic.conv().eV2Joule<float_64>(temperatureTimesk_Boltzman)
+                / (sim.pic.getElectronCharge<float_64>() * sim.pic.getElectronCharge<float_64>() * electronDensity
+                   * (unit_length * unit_length * unit_length) * static_cast<float_64>(chargeState + 1)));
+
+            using SCFLYStewartPyattIPD =
+                particles::atomicPhysics::ionizationPotentialDepression::template StewartPyattIPD<
+                    particles::atomicPhysics::ionizationPotentialDepression::RelativisticTemperatureFunctor,
+                    true>;
+
+            auto const input = SCFLYStewartPyattIPD::SuperCellConstantInput{
+                static_cast<float_X>(temperatureTimesk_Boltzman),
+                static_cast<float_X>(debyeLength),
+                static_cast<float_X>(chargeState),
+                static_cast<float_X>(densityPIC)};
+
+            return static_cast<float_64>(SCFLYStewartPyattIPD::ipd(input, chargeState));
+        }
+
+        /** cold limit: T == 0 must give the finite ion-sphere value, not 0
+         *
+         * SCFLY scdrv.f:3537,  dE(T=0) = 2.16e-7[eV cm] * z / r_ion,  z = chargeState + 1,
+         *  r_ion = (0.75 * z / (pi * n_e))^(1/3).
+         * The K-based Stewart-Pyatt branch returns exactly 0 here, which suppressed IPD entirely
+         *  in cold dense plasma and left high-n Rydberg states available to recombination.
+         */
+        bool testStewartPyattIPDColdLimit() const
+        {
+            // 1/m^3, solid-density Si3+ conditions
+            float_64 const electronDensity = 2.4e30;
+            uint8_t const chargeState = 3u;
+            float_64 const z = static_cast<float_64>(chargeState + 1u);
+
+            // m
+            float_64 const ionSphereRadius = std::pow(0.75 * z / (3.14159265358979323846 * electronDensity), 1. / 3.);
+            // eV; 2.16e-7 eV*cm = 2.16e-9 eV*m
+            float_64 const correctIPDValue = 2.16e-9 * z / ionSphereRadius;
+
+            float_64 const ipd = scflyExtendedIPD(electronDensity, 0., chargeState);
+
+            return testRelativeError<T_consoleOutput>(
+                correctIPDValue,
+                ipd,
+                "Stewart-Pyatt IPD, cold limit (T = 0)",
+                1e-2);
+        }
+
+        //! low temperature must converge to the cold limit, not collapse to 0
+        bool testStewartPyattIPDLowTemperatureConvergence() const
+        {
+            float_64 const electronDensity = 2.4e30;
+            uint8_t const chargeState = 3u;
+
+            float_64 const coldValue = scflyExtendedIPD(electronDensity, 0., chargeState);
+            float_64 const nearColdValue = scflyExtendedIPD(electronDensity, 1.e-3, chargeState);
+
+            return testRelativeError<T_consoleOutput>(
+                coldValue,
+                nearColdValue,
+                "Stewart-Pyatt IPD, low temperature converges to cold limit",
+                1e-2);
+        }
+
+        /** finite temperature must stay on the Debye-Huckel branch
+         *
+         * For lambda_D >> r_ion the ion-sphere bracket tends to 2/(3r), so
+         *  dE -> 1.44e-7[eV cm] * z / lambda_D, and the min() picks the 1.45e-7 sqrt branch.
+         * This guards against the cold-limit fix leaking into the hot regime.
+         */
+        bool testStewartPyattIPDFiniteTemperature() const
+        {
+            float_64 const electronDensity = 4.e28;
+            uint8_t const chargeState = 2u;
+
+            float_64 const hotValue = scflyExtendedIPD(electronDensity, 1.e3, chargeState);
+            float_64 const coldValue = scflyExtendedIPD(electronDensity, 0., chargeState);
+
+            // hot IPD must be strictly below the cold ion-sphere ceiling, and strictly positive
+            bool const pass = (hotValue > 0.) && (hotValue < coldValue);
+
+            if constexpr(T_consoleOutput)
+                std::cout << "  Stewart-Pyatt IPD, finite temperature below cold ceiling: " << hotValue << " eV < "
+                          << coldValue << " eV -> " << (pass ? "pass" : "FAIL") << std::endl;
+            return pass;
+        }
+
+        //! zero electron density must not produce NaN/Inf
+        bool testStewartPyattIPDZeroDensity() const
+        {
+            float_64 const ipd = scflyExtendedIPD(1.e-30, 0., 1u);
+            bool const pass = std::isfinite(ipd) && (ipd >= 0.);
+
+            if constexpr(T_consoleOutput)
+                std::cout << "  Stewart-Pyatt IPD, vanishing density finite: " << ipd << " eV -> "
+                          << (pass ? "pass" : "FAIL") << std::endl;
+            return pass;
+        }
+
         bool testAll()
         {
             bool passTotal = testStewartPyattIPD();
+            passTotal = testStewartPyattIPDColdLimit() && passTotal;
+            passTotal = testStewartPyattIPDLowTemperatureConvergence() && passTotal;
+            passTotal = testStewartPyattIPDFiniteTemperature() && passTotal;
+            passTotal = testStewartPyattIPDZeroDensity() && passTotal;
 
             if constexpr(T_consoleOutput)
             {

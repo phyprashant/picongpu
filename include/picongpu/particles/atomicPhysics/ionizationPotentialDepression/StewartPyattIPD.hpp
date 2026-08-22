@@ -331,24 +331,6 @@ namespace picongpu::particles::atomicPhysics::ionizationPotentialDepression
 
             float_X const chargeStateAsFloat = static_cast<float_X>(chargeState);
 
-            // UNIT_MASS * UNIT_LENGTH^3 / UNIT_TIME^2 * 1/(eV * UNIT_ENERGY/eV * UNIT_LENGTH)
-            // = unitless, not weighted
-            //! @details choice of core charge as (charge state + 1), according to [2]
-            float_X const K
-                = (pmacc::math::isApproxZero(
-                      superCellConstantInput.temperatureTimesk_Boltzman * superCellConstantInput.debyeLength))
-                      ? 0._X
-                      : constFactor * (chargeStateAsFloat + 1._X)
-                            / (superCellConstantInput.temperatureTimesk_Boltzman * eV
-                               * superCellConstantInput.debyeLength);
-
-            // eV, not weighted
-            //! @details based on equation (5) from Stewart-Pyatt(1966)
-            float_X const stewartPyattIPD
-                = superCellConstantInput.temperatureTimesk_Boltzman
-                  * (math::pow((3._X * (superCellConstantInput.zStar + 1._X) * K + 1._X), 2._X / 3._X) - 1._X)
-                  / (2._X * (superCellConstantInput.zStar + 1._X));
-
             //! @details additional IPD contribution as implemented in SCFLY,
             float_X result = 0._X;
             if constexpr(T_useSCFLYextendedStewartPyattIPD)
@@ -370,19 +352,70 @@ namespace picongpu::particles::atomicPhysics::ionizationPotentialDepression
                 constexpr float_X constFactorSCFLY = 1.45e-7_X * 1.e-2_X / sim.unit.length();
 
                 // 1 * eV * unit_length / sqrt(unit_length^2 + unit_length^2) = eV, not weighted
+                // SCFLY `debye1`, scdrv.f:3538
                 float_X const scfly_secondBranch
                     = constFactorSCFLY * (chargeStateAsFloat + 1._X)
                       / math::sqrt(
                           (ionSphereRadius / 1.5_X) * (ionSphereRadius / 1.5_X)
                           + (superCellConstantInput.debyeLength) * (superCellConstantInput.debyeLength));
 
+                /** radius-based Stewart-Pyatt, SCFLY `debye0`, scdrv.f:3537
+                 *
+                 *      dE = 2.16e-7 * z / r_ion * [ (1 + r^3)^(2/3) - r^2 ],   r = lambda_D / r_ion
+                 *
+                 * This replaces the K-based form inside the minimum. The K-based expression carries a
+                 *  `isApproxZero(T * lambda_D) ? 0` guard and its prefactor is T itself, so it returns
+                 *  *exactly zero* as T -> 0 and then wins the min(), suppressing IPD entirely in a cold
+                 *  dense plasma. That is not the physical strong-coupling limit: as T -> 0 the bracket
+                 *  below tends to 1 and dE tends to the finite ion-sphere value 2.16e-7 * z / r_ion
+                 *  (~117 eV for q=3 at n_e = 2.4e30 m^-3), which is enough to pressure-ionize high-n states.
+                 *
+                 * The bracket is evaluated without cancellation. With a = (1 + r^3)^(1/3), a^3 - r^3 = 1
+                 *  gives (a - r)(a^2 + a r + r^2) = 1, hence
+                 *      (1 + r^3)^(2/3) - r^2 = a^2 - r^2 = (a + r) / (a^2 + a r + r^2).
+                 *  Limits: r -> 0 gives 1, r -> inf gives 2/(3r), matching the Debye-Huckel branch.
+                 */
+                // (eV * cm) * m/cm / (m/unit_length) = eV * unit_length
+                constexpr float_X constFactorSCFLYIonSphere = 2.16e-7_X * 1.e-2_X / sim.unit.length();
+
+                // unitless, not weighted
+                float_X const rfz = superCellConstantInput.debyeLength / ionSphereRadius;
+                float_X const aRoot = math::pow(1._X + rfz * rfz * rfz, 1._X / 3._X);
+                // unitless, in (0, 1]; denominator >= 1 since aRoot >= 1
+                float_X const ionSphereShape = (aRoot + rfz) / (aRoot * aRoot + aRoot * rfz + rfz * rfz);
+
+                // eV, not weighted
+                float_X const scfly_firstBranch = constFactorSCFLYIonSphere * (chargeStateAsFloat + 1._X)
+                    / ionSphereRadius * ionSphereShape;
+
                 /** @details the factor zz = (chargeState + 1) before the minimum in the SCFLY implementation has been
-                 *  moved inside the SCFLY and stewartPyattIPD branches for better encapsulation */
-                result = math::min(scfly_secondBranch, stewartPyattIPD);
+                 *  moved inside the branches for better encapsulation */
+                result = math::min(scfly_secondBranch, scfly_firstBranch);
             }
             else
             {
-                result = stewartPyattIPD;
+                /** @attention this branch keeps the K-based form, which returns *exactly zero* as
+                 *  T -> 0 (the isApproxZero guard, plus T as the overall prefactor). It therefore
+                 *  still has no strong-coupling limit in a cold dense plasma. It is left as-is because
+                 *  it uses zStar rather than the local charge state and is a different approximation;
+                 *  switching it to the radius form is a separate decision. */
+
+                // UNIT_MASS * UNIT_LENGTH^3 / UNIT_TIME^2 * 1/(eV * UNIT_ENERGY/eV * UNIT_LENGTH)
+                // = unitless, not weighted
+                //! @details choice of core charge as (charge state + 1), according to [2]
+                float_X const K
+                    = (pmacc::math::isApproxZero(
+                          superCellConstantInput.temperatureTimesk_Boltzman * superCellConstantInput.debyeLength))
+                          ? 0._X
+                          : constFactor * (chargeStateAsFloat + 1._X)
+                                / (superCellConstantInput.temperatureTimesk_Boltzman * eV
+                                   * superCellConstantInput.debyeLength);
+
+                // eV, not weighted
+                //! @details based on equation (5) from Stewart-Pyatt(1966)
+                result = superCellConstantInput.temperatureTimesk_Boltzman
+                    * (math::pow((3._X * (superCellConstantInput.zStar + 1._X) * K + 1._X), 2._X / 3._X) - 1._X)
+                    / (2._X * (superCellConstantInput.zStar + 1._X));
             }
 
             // eV, not weighted
