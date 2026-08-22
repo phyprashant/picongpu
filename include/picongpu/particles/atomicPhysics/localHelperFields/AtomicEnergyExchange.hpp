@@ -77,6 +77,42 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
         }
         //!@}
 
+        /** book an internal energy jump made outside the atomicPhysics transition machinery
+         *
+         * Charge state changes applied by other modules, field ionization in particular, reach atomicPhysics only as
+         * a changed boundElectrons attribute. FixAtomicState reconciles them by moving the ion to the ground state of
+         * its new charge state, which changes internal energy without any transition being chosen or accepted, so no
+         * ProcessClass applies. Kept separate from the per-process array for that reason.
+         *
+         * @attention unperturbed table energies, no IPD shift: the module that ionized the ion did not apply one
+         *  either. See addReconciliationEnergyBlockWide callers.
+         * @attention must be called by exactly one worker of the block, see addAtomicEnergyBlockWide
+         */
+        template<typename T_Worker>
+        HDINLINE void addReconciliationEnergyBlockWide(T_Worker const& worker, float_64 const energy)
+        {
+            alpaka::atomicAdd(worker.getAcc(), &reconciliationEnergy, energy, ::alpaka::hierarchy::Blocks{});
+        }
+
+        /** count macro ion weight arriving from an ionization module outside atomicPhysics
+         *
+         * Their previous atomic state is destroyed by SetChargeState before atomicPhysics ever sees them, so the
+         * internal energy they carried cannot be booked. A non-zero count means the ledger is incomplete by an
+         * unknown amount, which the plugin reports; see FixAtomicStateKernel.
+         *
+         * @attention must be called by exactly one worker of the block, see addAtomicEnergyBlockWide
+         */
+        template<typename T_Worker>
+        HDINLINE void addExternalIonizationWeightBlockWide(T_Worker const& worker, float_64 const weight)
+        {
+            alpaka::atomicAdd(worker.getAcc(), &externalIonizationWeight, weight, ::alpaka::hierarchy::Blocks{});
+        }
+
+        HDINLINE float_64 getExternalIonizationWeight() const
+        {
+            return externalIonizationWeight;
+        }
+
         HDINLINE float_64 getAtomicEnergy(uint32_t const process) const
         {
             return atomicEnergy[process];
@@ -87,8 +123,17 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
             return radiatedEnergy[process];
         }
 
+        HDINLINE float_64 getReconciliationEnergy() const
+        {
+            return reconciliationEnergy;
+        }
+
     private:
         float_64 atomicEnergy[numberProcesses] = {0.0};
         float_64 radiatedEnergy[numberProcesses] = {0.0};
+        //! weighted eV, internal energy moved by charge state changes made outside atomicPhysics
+        float_64 reconciliationEnergy = 0.0;
+        //! weight of macro ions reconciled after an external ionization, whose energy could not be booked
+        float_64 externalIonizationWeight = 0.0;
     };
 } // namespace picongpu::particles::atomicPhysics::localHelperFields

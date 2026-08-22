@@ -892,9 +892,12 @@ namespace picongpu::simulation::stage
 
     void AtomicPhysics::fixAtomicStateInit(picongpu::MappingDesc const mappingDesc)
     {
+        /* initialisation: every ion still has an invalid collection index and none of it is energy moving, so
+         * the external-ionization counting must stay off here
+         */
         using ForEachIonSpeciesFixAtomicState = pmacc::meta::ForEach<
             SpeciesRepresentingAtomicPhysicsIons,
-            particles::atomicPhysics::stage::FixAtomicState<boost::mpl::_1>>;
+            particles::atomicPhysics::stage::FixAtomicStateInit<boost::mpl::_1>>;
         ForEachIonSpeciesFixAtomicState{}(mappingDesc);
     }
 

@@ -21,8 +21,11 @@
 
 #include "picongpu/defines.hpp"
 #include "picongpu/particles/atomicPhysics/ConvertEnum.hpp"
+#include "picongpu/particles/atomicPhysics/KernelIndexation.hpp"
 #include "picongpu/particles/traits/GetNumberAtomicStates.hpp"
 
+#include <pmacc/lockstep.hpp>
+#include <pmacc/memory/shared/Allocate.hpp>
 #include <pmacc/particles/algorithm/ForEach.hpp>
 
 #include <cstdint>
@@ -32,9 +35,28 @@ namespace picongpu::particles::atomicPhysics::kernel
     /** search for mismatch between atomic state charge state and boundElectrons and fix them by setting the
      *  atomic state to the ground state of the charge state if mismatched.
      *
-     * @param T_IonSpecies resolved type of the Ion Species
+     * Both reasons to fix an ion move internal energy, and neither is recorded by the transition machinery, so both
+     * are accounted for here.
+     *
+     * 1. valid collection index, but boundElectrons disagrees with it. The energy jump is exactly known and is
+     *    booked into the ledger. Note that SetChargeState invalidates the collection index whenever it changes
+     *    boundElectrons, so nothing in the current tree reaches this branch; it is kept for a module that would
+     *    update boundElectrons alone.
+     *
+     * 2. invalid collection index. This is how external ionization actually arrives: BSI, ADK, Keldysh and
+     *    ThomasFermi all call SetChargeState, which invalidates the index because it cannot reach the atomic data
+     *    needed to pick a consistent state. The ion's previous atomic state is destroyed at that moment, so the
+     *    energy it carried is not recoverable here and cannot be booked. Those ions are counted instead, and the
+     *    count is reported by the AtomicEnergyExchange plugin, so an incomplete ledger is visible in the output
+     *    rather than silent.
+     *
+     *    During initialisation every ion has an invalid index and none of it is energy moving, so the counting is
+     *    switched off for that call via T_countExternalIonization.
+     *
+     * @tparam T_IonSpecies resolved type of the Ion Species
+     * @tparam T_countExternalIonization false for the initialisation call, true for the per-step call
      */
-    template<typename T_IonSpecies>
+    template<typename T_IonSpecies, bool T_countExternalIonization = true>
     struct FixAtomicStateKernel
     {
         /** call operator
@@ -46,26 +68,59 @@ namespace picongpu::particles::atomicPhysics::kernel
          * @param ionBox deviceDataBox giving access to the particle frames of all local superCells
          * @param chargeStateOrgaBox deviceDataBox giving access to charge state orga data
          * @param atomicStateDataBox deviceDataBox giving access to atomic state property data
+         * @param chargeStateDataBox deviceDataBox giving access to charge state property data
+         * @param atomicEnergyExchangeBox deviceDataBox giving access to the per-superCell atomic energy ledger
          */
         template<
             typename T_Worker,
             typename T_AreaMapping,
             typename T_IonBox,
             typename T_ChargeStateOrgaDataBox,
-            typename T_AtomicStateDataDataBox>
+            typename T_AtomicStateDataDataBox,
+            typename T_ChargeStateDataDataBox,
+            typename T_AtomicEnergyExchangeBox>
         HDINLINE void operator()(
             T_Worker const& worker,
             T_AreaMapping const areaMapping,
             T_IonBox ionBox,
             T_ChargeStateOrgaDataBox const chargeStateOrgaBox,
-            T_AtomicStateDataDataBox const atomicStateDataBox) const
+            T_AtomicStateDataDataBox const atomicStateDataBox,
+            T_ChargeStateDataDataBox const chargeStateDataBox,
+            T_AtomicEnergyExchangeBox atomicEnergyExchangeBox) const
         {
             pmacc::DataSpace<simDim> const superCellIdx = areaMapping.getSuperCellIndex(worker.blockDomIdxND());
+            pmacc::DataSpace<simDim> const superCellFieldIdx
+                = KernelIndexation::getSuperCellFieldIndexFromSuperCellIndex(areaMapping, superCellIdx);
 
             auto forEachLocalIonBoxEntry = pmacc::particles::algorithm::acc::makeForEach(worker, ionBox, superCellIdx);
 
+            if(!forEachLocalIonBoxEntry.hasParticles())
+                return;
+
+            //! weighted eV, block wide accumulator of the reconciliation ledger entry
+            PMACC_SMEM(worker, sharedReconciliationEnergy, float_64);
+            //! weight, block wide accumulator of ions arriving from outside atomicPhysics
+            PMACC_SMEM(worker, sharedExternalWeight, float_64);
+
+            auto onlyMaster = lockstep::makeMaster(worker);
+            onlyMaster(
+                [&sharedReconciliationEnergy, &sharedExternalWeight]()
+                {
+                    sharedReconciliationEnergy = 0.0;
+                    sharedExternalWeight = 0.0;
+                });
+            worker.sync();
+
+            // private to this worker thread
+            float_64 threadReconciliationEnergy = 0.0;
+            float_64 threadExternalWeight = 0.0;
+
             forEachLocalIonBoxEntry(
-                [&chargeStateOrgaBox, &atomicStateDataBox](T_Worker const& worker, auto& ion)
+                [&chargeStateOrgaBox,
+                 &atomicStateDataBox,
+                 &chargeStateDataBox,
+                 &threadReconciliationEnergy,
+                 &threadExternalWeight]([[maybe_unused]] T_Worker const& worker, auto& ion)
                 {
                     using ConfigNumber = typename T_AtomicStateDataDataBox::ConfigNumber;
                     uint8_t const boundElectrons = u8(ion[boundElectrons_]);
@@ -92,12 +147,65 @@ namespace picongpu::particles::atomicPhysics::kernel
                             updateStateCollectionIdx = true;
                     }
 
-                    if(updateStateCollectionIdx)
+                    if(!updateStateCollectionIdx)
+                        return;
+
+                    uint32_t const newCollectionIndex = atomicStateDataBox.findGroundState(
+                        chargeStateOrgaBox.numberAtomicStates(targetChargeState),
+                        chargeStateOrgaBox.startIndexBlockAtomicStates(targetChargeState));
+
+                    if(!isValidCollectionIdx)
                     {
-                        ion[atomicStateCollectionIndex_] = atomicStateDataBox.findGroundState(
-                            chargeStateOrgaBox.numberAtomicStates(targetChargeState),
-                            chargeStateOrgaBox.startIndexBlockAtomicStates(targetChargeState));
+                        /* arrived from outside atomicPhysics, previous atomic state already destroyed by
+                         * SetChargeState. Only countable, not bookable; see the class documentation.
+                         */
+                        if constexpr(T_countExternalIonization)
+                            threadExternalWeight += static_cast<float_64>(ion[weighting_]);
                     }
+                    else
+                    {
+                        //! eV, unperturbed table energy of an atomic state, neutral ground state reference
+                        auto stateEnergy = [&atomicStateDataBox, &chargeStateDataBox](uint32_t const stateIndex)
+                        {
+                            uint8_t const chargeState
+                                = ConfigNumber::getChargeState(atomicStateDataBox.configNumber(stateIndex));
+
+                            float_64 energy = static_cast<float_64>(atomicStateDataBox.energy(stateIndex));
+                            for(uint8_t q = 0u; q < chargeState; ++q)
+                                energy += static_cast<float_64>(chargeStateDataBox.ionizationEnergy(q));
+                            return energy;
+                        };
+
+                        threadReconciliationEnergy += (stateEnergy(newCollectionIndex) - stateEnergy(collectionIndex))
+                            * static_cast<float_64>(ion[weighting_]);
+                    }
+
+                    ion[atomicStateCollectionIndex_] = newCollectionIndex;
+                });
+
+            // reduce the ledger contributions of this block, one global atomic per block instead of per macro ion
+            alpaka::atomicAdd(
+                worker.getAcc(),
+                &sharedReconciliationEnergy,
+                threadReconciliationEnergy,
+                ::alpaka::hierarchy::Threads{});
+            alpaka::atomicAdd(
+                worker.getAcc(),
+                &sharedExternalWeight,
+                threadExternalWeight,
+                ::alpaka::hierarchy::Threads{});
+            worker.sync();
+
+            onlyMaster(
+                [&worker,
+                 &atomicEnergyExchangeBox,
+                 &superCellFieldIdx,
+                 &sharedReconciliationEnergy,
+                 &sharedExternalWeight]()
+                {
+                    auto& ledger = atomicEnergyExchangeBox(superCellFieldIdx);
+                    ledger.addReconciliationEnergyBlockWide(worker, sharedReconciliationEnergy);
+                    ledger.addExternalIonizationWeightBlockWide(worker, sharedExternalWeight);
                 });
         }
     };

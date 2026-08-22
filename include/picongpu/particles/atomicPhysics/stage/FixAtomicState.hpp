@@ -38,6 +38,7 @@
 
 #include "picongpu/defines.hpp"
 #include "picongpu/particles/atomicPhysics/kernel/FixAtomicState.kernel"
+#include "picongpu/particles/atomicPhysics/localHelperFields/AtomicEnergyExchangeField.hpp"
 #include "picongpu/particles/param.hpp"
 #include "picongpu/particles/traits/GetAtomicDataType.hpp"
 
@@ -58,8 +59,8 @@ namespace picongpu::particles::atomicPhysics::stage
      *
      * @tparam T_IonSpecies ion species type
      */
-    template<typename T_IonSpecies>
-    struct FixAtomicState
+    template<typename T_IonSpecies, bool T_countExternalIonization>
+    struct FixAtomicStateImpl
     {
         // might be alias, from here on out no more
         //! resolved type of alias T_IonSpecies
@@ -78,12 +79,41 @@ namespace picongpu::particles::atomicPhysics::stage
 
             auto& atomicData = *dc.get<AtomicDataType>(IonSpecies::FrameType::getName() + "_atomicData");
 
-            PMACC_LOCKSTEP_KERNEL(picongpu::particles::atomicPhysics::kernel::FixAtomicStateKernel<IonSpecies>())
+            auto atomicEnergyExchangeField
+                = dc.get<particles::atomicPhysics::localHelperFields::AtomicEnergyExchangeField<
+                    picongpu::MappingDesc,
+                    IonSpecies>>(IonSpecies::FrameType::getName() + "_atomicEnergyExchangeField");
+
+            PMACC_LOCKSTEP_KERNEL(picongpu::particles::atomicPhysics::kernel::
+                                      FixAtomicStateKernel<IonSpecies, T_countExternalIonization>())
                 .config(mapper.getGridDim(), ions)(
                     mapper,
                     ions.getDeviceParticlesBox(),
                     atomicData.template getChargeStateOrgaDataBox<false>(),
-                    atomicData.template getAtomicStateDataDataBox<false>());
+                    atomicData.template getAtomicStateDataDataBox<false>(),
+                    atomicData.template getChargeStateDataDataBox<false>(),
+                    atomicEnergyExchangeField->getDeviceDataBox());
         }
+    };
+
+    /* Both spellings below take exactly one template parameter on purpose: pmacc::meta::ForEach substitutes a
+     * boost::mpl placeholder, and a class template with a second parameter is not a valid mpl lambda expression,
+     * defaulted or not.
+     */
+
+    //! per-step call, counts macro ions arriving from an ionization module outside atomicPhysics
+    template<typename T_IonSpecies>
+    struct FixAtomicState : FixAtomicStateImpl<T_IonSpecies, true>
+    {
+    };
+
+    /** initialisation call, external-ionization counting switched off
+     *
+     * Every ion still has an invalid collection index at initialisation and none of it is energy moving, so counting
+     * it as arriving from an external ionizer would be wrong.
+     */
+    template<typename T_IonSpecies>
+    struct FixAtomicStateInit : FixAtomicStateImpl<T_IonSpecies, false>
+    {
     };
 } // namespace picongpu::particles::atomicPhysics::stage
