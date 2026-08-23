@@ -228,23 +228,29 @@ namespace picongpu::particles::atomicPhysics::kernel
 
                         // 1/picongpu::sim.unit.time()
                         float_X sumRateCollisionalIonization = 0._X;
-                        for(uint32_t binIndex = u32(0u); binIndex < T_numberBins; ++binIndex)
+                        /* the analytic three-body closure derives the inverse rate from T_e and n_e directly
+                         *  and does not consume the sampled ionization sum; skipping the loop also removes
+                         *  T_numberBins cross section evaluations per transition from this kernel */
+                        if constexpr(!rateCalculation::useAnalyticThreeBodyClosure)
                         {
-                            sumRateCollisionalIonization += atomicPhysics::rateCalculation::
-                                BoundFreeCollisionalTransitionRates<T_numberLevels>::
-                                    template rateCollisionalIonizationTransition<
-                                        T_ChargeStateDataDataBox,
-                                        T_AtomicStateDataDataBox,
-                                        T_BoundFreeTransitionDataBox>(
-                                        cachedHistogram.energy[binIndex],
-                                        cachedHistogram.binWidth[binIndex],
-                                        cachedHistogram.rateDensity[binIndex],
-                                        cachedHistogram.densitySlopeToNextBin(binIndex),
-                                        ionizationPotentialDepression,
-                                        transitionCollectionIndex,
-                                        chargeStateDataDataBox,
-                                        atomicStateDataDataBox,
-                                        boundFreeTransitionDataBox);
+                            for(uint32_t binIndex = u32(0u); binIndex < T_numberBins; ++binIndex)
+                            {
+                                sumRateCollisionalIonization += atomicPhysics::rateCalculation::
+                                    BoundFreeCollisionalTransitionRates<T_numberLevels>::
+                                        template rateCollisionalIonizationTransition<
+                                            T_ChargeStateDataDataBox,
+                                            T_AtomicStateDataDataBox,
+                                            T_BoundFreeTransitionDataBox>(
+                                            cachedHistogram.energy[binIndex],
+                                            cachedHistogram.binWidth[binIndex],
+                                            cachedHistogram.rateDensity[binIndex],
+                                            cachedHistogram.densitySlopeToNextBin(binIndex),
+                                            ionizationPotentialDepression,
+                                            transitionCollectionIndex,
+                                            chargeStateDataDataBox,
+                                            atomicStateDataDataBox,
+                                            boundFreeTransitionDataBox);
+                            }
                         }
 
                         // 1/picongpu::sim.unit.time()

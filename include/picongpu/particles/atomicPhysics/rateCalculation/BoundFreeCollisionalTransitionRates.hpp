@@ -25,6 +25,7 @@
 #include "picongpu/particles/atomicPhysics/debug/param.hpp"
 #include "picongpu/particles/atomicPhysics/rateCalculation/CollisionalRate.hpp"
 #include "picongpu/particles/atomicPhysics/rateCalculation/ThresholdClip.hpp"
+#include "picongpu/particles/atomicPhysics/rateCalculation/ThreeBodyClosure.hpp"
 #include "picongpu/particles/atomicPhysics/rateCalculation/Multiplicities.hpp"
 #include "picongpu/particles/atomicPhysics/stateRepresentation/ConfigNumber.hpp"
 
@@ -93,6 +94,24 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
         HDINLINE static float_64 wFactor(float_X const U, float_X const beta)
         {
             return math::pow(static_cast<float_64>(math::log(U)), static_cast<float_64>(beta / U));
+        }
+
+        /** ln(1 + z), accurate for small z, given z and the already formed onePlusZ = 1 + z
+         *
+         * alpaka provides no log1p. Forming 1 + z rounds away the leading digits of z once
+         * z drops below the machine epsilon of the sum, and log() of that is then wrong by
+         * the same amount. Rescaling by z / ((1 + z) - 1) undoes exactly that rounding,
+         * because the two roundings are the same one. Standard trick, see Goldberg (1991).
+         *
+         * @param z the increment, unitless
+         * @param onePlusZ 1 + z, passed in because the caller needs it anyway
+         *
+         * @return unitless
+         */
+        HDINLINE static float_64 logOnePlus(float_64 const z, float_64 const onePlusZ)
+        {
+            float_64 const rounded = onePlusZ - 1.;
+            return (rounded == 0.) ? z : math::log(onePlusZ) * z / rounded;
         }
 
     public:
@@ -351,6 +370,128 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
                 * lambdaDeBroglieCubed * volumeConversionFactor * math::exp(exponent);
         }
 
+        /** three-body recombination rate of a bound-free transition, analytic Maxwellian closure
+         *
+         * Evaluates R_3BR = D * R_EII^M as a single threshold-shifted integral, so that the
+         * exp(+DeltaE/T_e) of the Saha factor D and the exp(-DeltaE/T_e) of the Maxwellian
+         * ionization rate R_EII^M cancel analytically and neither is ever constructed. See
+         * ThreeBodyClosure.hpp for the derivation and the assumptions.
+         *
+         * With the Burgess-Chidichimo cross section used here,
+         *  sigma(E) = scalingConstant * multiplicity / DeltaE^2 * ln(U) * w(U, beta) / U,
+         *  U = E/DeltaE,
+         * the 1/U cancels against the sqrt(E) of the Maxwellian and
+         *  sigma(E) * sqrt(E) = scalingConstant * multiplicity / DeltaE^(3/2) * ln(U) * w(U, beta) / sqrt(U).
+         * Nothing in that expression is large or small, whatever DeltaE/T_e is.
+         *
+         * @attention everything here runs in float_64 and ln(U) goes through logOnePlus(),
+         *  because U - 1, not U, is the quantity that carries the answer for DeltaE >> T_e.
+         *  Calling collisionalIonizationCrossSection() instead would form U in float_X and
+         *  lose those digits. TestRateCalculation.hpp checks the two against each other in
+         *  the moderate-U regime, where the cancellation is harmless.
+         *
+         * @param temperatureElectrons local electron temperature as k_B * T, [eV]
+         * @param densityElectrons local total electron number density, [1/sim.unit.length()^3]
+         * @param deltaEnergyTransition IPD-shifted ionization threshold of the transition, [eV]
+         * @param screenedCharge screened charge of the lower(recombined) state minus one, [e]
+         * @param combinatorialFactor multiplicity of the bound-free transition
+         * @param multiplicityLowerState statistical weight of the lower(recombined) atomic state
+         * @param multiplicityUpperState statistical weight of the upper(ionized) atomic state
+         *
+         * @return unit: 1/sim.unit.time(), 0 for invalid input(T_e <= 0, n_e <= 0 or DeltaE <= 0)
+         */
+        HDINLINE static float_64 analyticMaxwellianThreeBodyRate(
+            // eV
+            float_X const temperatureElectrons,
+            // 1/sim.unit.length()^3
+            float_X const densityElectrons,
+            // eV
+            float_X const deltaEnergyTransition,
+            // e
+            float_X const screenedCharge,
+            float_64 const combinatorialFactor,
+            float_64 const multiplicityLowerState,
+            float_64 const multiplicityUpperState)
+        {
+            /* barrier-free transitions (DeltaE <= 0, possible with strong IPD) have no defined detailed balance
+             *  factor, skip them like the collisional ionization cross section does */
+            if((temperatureElectrons <= 0._X) || (densityElectrons <= 0._X) || (deltaEnergyTransition <= 0._X))
+                return 0.;
+
+            float_64 const temperature = static_cast<float_64>(temperatureElectrons);
+            float_64 const deltaEnergy = static_cast<float_64>(deltaEnergyTransition);
+            float_64 const density = static_cast<float_64>(densityElectrons);
+
+            // m^2 * eV, = 2 * pi * hbar^2 / (m_e * 1eV)
+            constexpr float_64 deBroglieFactor = 2. * picongpu::PI * pmacc::math::cPow(sim.si.getHbar(), 2u)
+                / (sim.si.getElectronMass() * sim.si.get_eV());
+            // sim.unit.length()^3 / m^3
+            constexpr float_64 volumeConversionFactor = 1. / pmacc::math::cPow(float_64(sim.unit.length()), 3u);
+            // m^3
+            float_64 const lambdaDeBroglieCubed = math::pow(deBroglieFactor / temperature, 1.5);
+
+            /* Saha factor D without its exp(DeltaE/T_e), which cancels against the Maxwellian below.
+             * unitless */
+            float_64 const sahaFactorNoExponential = 0.5 * multiplicityLowerState / multiplicityUpperState * density
+                * lambdaDeBroglieCubed * volumeConversionFactor;
+
+            // same constants as collisionalIonizationCrossSection(), see there
+            constexpr float_64 C = 2.3;
+            constexpr float_64 a0 = sim.si.getBohrRadius();
+            constexpr float_64 E_R = sim.si.conv().joule2eV(sim.si.getRydbergEnergy());
+            // 10^6*b * eV^2
+            constexpr float_64 scalingConstant
+                = C * picongpu::PI * pmacc::math::cPow(a0, 2u) / 1e-22 * pmacc::math::cPow(E_R, 2u);
+
+            // 10^6*b * eV^(1/2), prefactor of sigma(E) * sqrt(E)
+            float_64 const crossSectionPrefactor
+                = scalingConstant * combinatorialFactor / math::pow(deltaEnergy, 1.5);
+
+            // unitless
+            float_64 const beta = static_cast<float_64>(betaFactor(screenedCharge));
+
+            // eV, ~ 5.11e5
+            constexpr float_64 electronRestMassEnergy
+                = sim.si.getElectronMass() * pmacc::math::cPow(sim.si.getSpeedOfLight(), 2u) / sim.si.get_eV();
+            // sim.unit.length()^2 / (10^6*b)
+            constexpr float_64 conversionFactorSigma
+                = 1.e-22 / (float_64(sim.unit.length()) * float_64(sim.unit.length()));
+            // c_internal == 1, asserted in CollisionalRate.hpp which shares this convention
+
+            /* int_0^inf sigma(DeltaE + T*x) * sqrt(DeltaE + T*x) * v(DeltaE + T*x) * e^(-x) dx
+             * unit: 10^6*b * eV^(1/2) * sim.unit.length()/sim.unit.time() */
+            float_64 integral = 0.;
+            for(uint32_t k = 0u; k < GaussLaguerre16::numberNodes; ++k)
+            {
+                // unitless, = U - 1; this, not U, is the small quantity for DeltaE >> T
+                float_64 const excess = temperature * GaussLaguerre16::node(k) / deltaEnergy;
+                // unitless
+                float_64 const U = 1. + excess;
+                // unitless, = ln(U), kept accurate for DeltaE >> T
+                float_64 const logU = logOnePlus(excess, U);
+
+                // w factor from Burgess and Chidichimo(1983), unitless
+                float_64 const w = math::pow(logU, beta / U);
+
+                // eV
+                float_64 const energyElectron = deltaEnergy * U;
+                // unitless, v/c
+                float_64 const gamma = 1. + energyElectron / electronRestMassEnergy;
+                float_64 const betaRelativistic = math::sqrt(1. - 1. / (gamma * gamma));
+
+                integral += GaussLaguerre16::weight(k) * logU * w / math::sqrt(U) * betaRelativistic;
+            }
+            integral *= crossSectionPrefactor * conversionFactorSigma;
+
+            /* 2/sqrt(pi), from the normalisation of the Maxwellian energy distribution */
+            constexpr float_64 maxwellianNorm = 2. / 1.7724538509055160273;
+
+            /* unitless * 1/sim.unit.length()^3 * unitless * 1/eV^(1/2)
+             *   * (sim.unit.length()^2 * eV^(1/2) * sim.unit.length()/sim.unit.time())
+             * unit: 1/sim.unit.time() */
+            return sahaFactorNoExponential * density * maxwellianNorm / math::sqrt(temperature) * integral;
+        }
+
         /** relative probability of capturing a free electron of given energy in three-body recombination
          *
          * Three-body recombination captures a free electron by transferring its kinetic energy plus the released
@@ -391,8 +532,14 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
 
         /** rate of collisional three-body recombination for a given bound-free transition
          *
-         * Maxwellian detailed balance inverse of the collisional ionization rate of the same transition,
-         *  see threeBodyDetailedBalanceFactor() for the model and its limitations.
+         * Maxwellian detailed balance inverse of the collisional ionization of the same transition. With
+         *  useAnalyticThreeBodyClosure (the default) the detailed balance product is evaluated as one
+         *  threshold-shifted integral by analyticMaxwellianThreeBodyRate(); see ThreeBodyClosure.hpp for the
+         *  derivation, the assumptions and the two failure modes of the historic factorised form.
+         *
+         * @attention with the switch off the historic form is used, D * (sampled histogram EII sum). That is
+         *  identically zero whenever no macro electron sits above the ionization threshold, which for
+         *  DeltaE/T_e >~ 20 is essentially always. Kept for reproducing pre-fix results only.
          *
          * @tparam T_ChargeStateDataBox instantiated type of dataBox
          * @tparam T_AtomicStateDataBox instantiated type of dataBox
@@ -401,7 +548,8 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
          * @param temperatureElectrons local electron temperature as k_B * T, [eV]
          * @param densityElectrons local total electron number density, [1/sim.unit.length()^3]
          * @param sumRateCollisionalIonization collisional ionization rate of the same transition, summed over all
-         *  electron histogram bins, [1/sim.unit.time()]
+         *  electron histogram bins, [1/sim.unit.time()]; unused unless the analytic closure is switched off,
+         *  callers should skip the bin sum entirely when useAnalyticThreeBodyClosure
          * @param ionizationPotentialDepression eV
          * @param transitionCollectionIndex index of transition in boundFreeTransitionDataBox
          * @param chargeStateDataBox access to charge state property data
@@ -441,8 +589,9 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
                     return 0._X;
             }
 #endif
-            if(sumRateCollisionalIonization <= 0._X)
-                return 0._X;
+            if constexpr(!useAnalyticThreeBodyClosure)
+                if(sumRateCollisionalIonization <= 0._X)
+                    return 0._X;
 
             uint32_t const lowerStateClctIdx
                 = boundFreeTransitionDataBox.lowerStateCollectionIndex(transitionCollectionIndex);
@@ -457,13 +606,29 @@ namespace picongpu::particles::atomicPhysics::rateCalculation
                 ionizationPotentialDepression,
                 chargeStateDataBox);
 
-            float_64 const rate = threeBodyDetailedBalanceFactor(
-                                      temperatureElectrons,
-                                      densityElectrons,
-                                      energyDifference,
-                                      static_cast<float_64>(atomicStateDataBox.multiplicity(lowerStateClctIdx)),
-                                      static_cast<float_64>(atomicStateDataBox.multiplicity(upperStateClctIdx)))
-                * static_cast<float_64>(sumRateCollisionalIonization);
+            float_64 rate;
+            if constexpr(useAnalyticThreeBodyClosure)
+            {
+                rate = analyticMaxwellianThreeBodyRate(
+                    temperatureElectrons,
+                    densityElectrons,
+                    energyDifference,
+                    // e, same screened charge as in collisionalIonizationCrossSection()
+                    atomicStateDataBox.screenedCharge(lowerStateClctIdx) - 1._X,
+                    static_cast<float_64>(boundFreeTransitionDataBox.multiplicity(transitionCollectionIndex)),
+                    static_cast<float_64>(atomicStateDataBox.multiplicity(lowerStateClctIdx)),
+                    static_cast<float_64>(atomicStateDataBox.multiplicity(upperStateClctIdx)));
+            }
+            else
+            {
+                rate = threeBodyDetailedBalanceFactor(
+                           temperatureElectrons,
+                           densityElectrons,
+                           energyDifference,
+                           static_cast<float_64>(atomicStateDataBox.multiplicity(lowerStateClctIdx)),
+                           static_cast<float_64>(atomicStateDataBox.multiplicity(upperStateClctIdx)))
+                    * static_cast<float_64>(sumRateCollisionalIonization);
+            }
 
             // protect float_X cast, overlarge rates only force smaller atomicPhysics sub-steps
             return static_cast<float_X>(

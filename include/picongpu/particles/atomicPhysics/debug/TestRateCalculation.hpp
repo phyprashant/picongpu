@@ -32,6 +32,7 @@
 // need unit.param
 
 #include "picongpu/particles/atomicPhysics/ConvertEnum.hpp"
+#include "picongpu/particles/atomicPhysics/DeltaEnergyTransition.hpp"
 #include "picongpu/particles/atomicPhysics/atomicData/AtomicTuples.def"
 #include "picongpu/particles/atomicPhysics/debug/TestRelativeError.hpp"
 #include "picongpu/particles/atomicPhysics/enums/ADKLaserPolarization.hpp"
@@ -398,8 +399,21 @@ namespace picongpu::particles::atomicPhysics::debug
 
         /** @return true =^= test passed
          *
-         * checks the detailed balance identity rate_3BR == D * rate_EII against the hand computed D_ref, with the
-         *  state multiplicities taken from the test data boxes, g_lower/g_upper = 162
+         * Checks the three-body recombination rate against the detailed balance product it is derived from,
+         *  R_3BR == D * R_EII^M, with D from the hand computed D_ref of testThreeBodyDetailedBalanceFactor()
+         *  and R_EII^M the Maxwellian collisional ionization rate.
+         *
+         * With the analytic closure (the default) R_EII^M is built here by feeding a finely resolved Maxwellian
+         *  through the production per-bin ionization rate, so this is the well-sampled histogram limit that the
+         *  closure has to reproduce. The reference is a midpoint rule over 4000 bins spanning 60 k_B*T above the
+         *  threshold; its own truncation and discretisation error is ~5e-5, hence the 1e-3 tolerance.
+         *
+         * @attention deliberately run at T_e = 100 eV, DeltaE = 105 eV. Only for DeltaE/T_e of order one can the
+         *  reference be formed as a product at all: at lower T_e exp(DeltaE/T_e) overflows and the sampled
+         *  Maxwellian underflows float_X, which is exactly the regime the closure exists to handle and which
+         *  testThreeBodyRecombinationAnalyticClosure() covers instead.
+         *
+         * With the closure switched off this degenerates to the historic single-bin identity check.
          */
         bool testThreeBodyRecombinationRate() const
         {
@@ -409,27 +423,78 @@ namespace picongpu::particles::atomicPhysics::debug
             float_X const densityTotalElectrons
                 = static_cast<float_X>(1.e28 * pmacc::math::cPow(picongpu::sim.unit.length(), 3u));
 
-            // 1/sim.unit.time()
-            float_X const sumRateCollisionalIonization
-                = rateCalculation::BoundFreeCollisionalTransitionRates<T_n_max, true>::
-                    rateCollisionalIonizationTransition(
-                        energyElectron,
-                        energyElectronBinWidth,
-                        static_cast<float_X>(densityElectrons * pmacc::math::cPow(picongpu::sim.unit.length(), 3u)),
-                        0._X,
-                        // ionization potential depression
-                        0._X,
-                        0u,
-                        chargeStateBuffer->getHostDataBox(),
-                        atomicStateBuffer->getHostDataBox(),
-                        boundFreeBuffer->getHostDataBox());
+            /* 1/sim.unit.time(), the collisional ionization rate the detailed balance factor multiplies.
+             * With the analytic closure this is the Maxwellian rate, sampled finely enough that the histogram
+             *  result and the closure must agree; without it, the historic single-bin rate. */
+            float_64 sumRateCollisionalIonization = 0.;
+            if constexpr(rateCalculation::useAnalyticThreeBodyClosure)
+            {
+                // eV, IPD-shifted ionization threshold of the test transition
+                float_X const deltaEnergyTransition = particles::atomicPhysics::DeltaEnergyTransition::get(
+                    0u,
+                    atomicStateBuffer->getHostDataBox(),
+                    boundFreeBuffer->getHostDataBox(),
+                    0._X,
+                    chargeStateBuffer->getHostDataBox());
+
+                constexpr uint32_t numberReferenceBins = 4000u;
+                // eV, 60 k_B*T above threshold captures the Maxwellian to better than 1e-26 of its peak
+                float_X const referenceSpan = 60._X * temperatureElectrons;
+                // eV
+                float_X const binWidth = referenceSpan / static_cast<float_X>(numberReferenceBins);
+
+                for(uint32_t binIndex = 0u; binIndex < numberReferenceBins; ++binIndex)
+                {
+                    // eV, bin center
+                    float_X const energy
+                        = deltaEnergyTransition + (static_cast<float_X>(binIndex) + 0.5_X) * binWidth;
+
+                    /* 1/(sim.unit.length()^3 * eV), n_e * f_Maxwell(E) with
+                     *  f_Maxwell(E) = 2/sqrt(pi) * T^(-3/2) * sqrt(E) * exp(-E/T) */
+                    float_X const density = densityTotalElectrons * 2._X
+                        / static_cast<float_X>(math::sqrt(picongpu::PI))
+                        * math::pow(temperatureElectrons, -1.5_X) * math::sqrt(energy)
+                        * math::exp(-energy / temperatureElectrons);
+
+                    sumRateCollisionalIonization += static_cast<float_64>(
+                        rateCalculation::BoundFreeCollisionalTransitionRates<T_n_max, true>::
+                            rateCollisionalIonizationTransition(
+                                energy,
+                                binWidth,
+                                density,
+                                0._X,
+                                // ionization potential depression
+                                0._X,
+                                0u,
+                                chargeStateBuffer->getHostDataBox(),
+                                atomicStateBuffer->getHostDataBox(),
+                                boundFreeBuffer->getHostDataBox()));
+                }
+            }
+            else
+            {
+                sumRateCollisionalIonization = static_cast<float_64>(
+                    rateCalculation::BoundFreeCollisionalTransitionRates<T_n_max, true>::
+                        rateCollisionalIonizationTransition(
+                            energyElectron,
+                            energyElectronBinWidth,
+                            static_cast<float_X>(
+                                densityElectrons * pmacc::math::cPow(picongpu::sim.unit.length(), 3u)),
+                            0._X,
+                            // ionization potential depression
+                            0._X,
+                            0u,
+                            chargeStateBuffer->getHostDataBox(),
+                            atomicStateBuffer->getHostDataBox(),
+                            boundFreeBuffer->getHostDataBox()));
+            }
 
             // 1/sim.unit.time()
             float_X const rate = rateCalculation::BoundFreeCollisionalTransitionRates<T_n_max, true>::
                 rateCollisionalThreeBodyRecombinationTransition(
                     temperatureElectrons,
                     densityTotalElectrons,
-                    sumRateCollisionalIonization,
+                    static_cast<float_X>(sumRateCollisionalIonization),
                     // ionization potential depression
                     0._X,
                     0u,
@@ -441,10 +506,79 @@ namespace picongpu::particles::atomicPhysics::debug
             float_64 const correctFactor = 7.668199883550e-01;
 
             return testRelativeError<T_consoleOutput>(
-                correctFactor * static_cast<float_64>(sumRateCollisionalIonization),
+                correctFactor * sumRateCollisionalIonization,
                 static_cast<float_64>(rate),
                 "three-body recombination rate",
-                1e-4);
+                rateCalculation::useAnalyticThreeBodyClosure ? 1e-3 : 1e-4);
+        }
+
+        /** @return true =^= test passed
+         *
+         * Covers what the historic factorised form could not represent at all, see ThreeBodyClosure.hpp:
+         *  - DeltaE/T_e = 1050, far past the exp() cap of 500 and past the float_64 overflow at ~709: the rate
+         *    must still be finite and strictly positive. The historic path returns zero here for two independent
+         *    reasons, a capped exponent and an empty sampled ionization tail.
+         *  - the rate is quadratic in n_e, one power from the Saha factor and one from the ionization rate. This
+         *    also proves the result is not sitting on the float_X saturation clamp.
+         *  - the rate rises monotonically as T_e falls, the expected steep low-temperature behaviour of
+         *    three-body recombination. The historic path does the opposite, it collapses to zero exactly where
+         *    recombination should take over.
+         */
+        bool testThreeBodyRecombinationAnalyticClosure() const
+        {
+            if constexpr(!rateCalculation::useAnalyticThreeBodyClosure)
+                return true;
+
+            using RateCalculator = rateCalculation::BoundFreeCollisionalTransitionRates<T_n_max, true>;
+
+            // 1/sim.unit.length()^3, = 1e28 1/m^3
+            float_X const densityTotalElectrons
+                = static_cast<float_X>(1.e28 * pmacc::math::cPow(picongpu::sim.unit.length(), 3u));
+
+            auto rateAt = [&](float_X const temperature, float_X const density)
+            {
+                return static_cast<float_64>(RateCalculator::rateCollisionalThreeBodyRecombinationTransition(
+                    temperature,
+                    density,
+                    // deliberately zero, the closure must not consume the sampled ionization sum
+                    0._X,
+                    // ionization potential depression
+                    0._X,
+                    0u,
+                    chargeStateBuffer->getHostDataBox(),
+                    atomicStateBuffer->getHostDataBox(),
+                    boundFreeBuffer->getHostDataBox()));
+            };
+
+            // eV, DeltaE = 105 eV for the test transition, so DeltaE/T_e = 1050
+            float_X const temperatureDeepBelowThreshold = 0.1_X;
+
+            float_64 const rateDeep = rateAt(temperatureDeepBelowThreshold, densityTotalElectrons);
+            bool const passFiniteBeyondCap = std::isfinite(rateDeep) && (rateDeep > 0.);
+
+            float_64 const rateDeepDoubleDensity
+                = rateAt(temperatureDeepBelowThreshold, 2._X * densityTotalElectrons);
+            bool const passDensityScaling = testRelativeError<false>(
+                4. * rateDeep,
+                rateDeepDoubleDensity,
+                "three-body recombination n_e^2 scaling",
+                1e-5);
+
+            bool const passMonotonic = (rateDeep > rateAt(10._X, densityTotalElectrons))
+                && (rateAt(10._X, densityTotalElectrons) > rateAt(100._X, densityTotalElectrons));
+
+            bool const pass = passFiniteBeyondCap && passDensityScaling && passMonotonic;
+
+            if constexpr(T_consoleOutput)
+            {
+                if(pass)
+                    std::cout << "three-body recombination analytic closure: * " << std::endl;
+                else
+                    std::cout << "three-body recombination analytic closure: x"
+                              << " finiteBeyondCap " << passFiniteBeyondCap << " densityScaling "
+                              << passDensityScaling << " monotonic " << passMonotonic << std::endl;
+            }
+            return pass;
         }
 
         //! @return true =^= test passed, checks input guards and the n_e scaling of the detailed balance factor
@@ -700,7 +834,7 @@ namespace picongpu::particles::atomicPhysics::debug
         //! @return true =^= all tests passed
         bool testAll()
         {
-            constexpr uint8_t numberTests = 15;
+            constexpr uint8_t numberTests = 16;
             bool pass[numberTests];
             pass[0] = testCollisionalExcitationCrossSection();
             pass[1] = testCollisionalDeexcitationCrossSection();
@@ -717,6 +851,7 @@ namespace picongpu::particles::atomicPhysics::debug
             pass[12] = testKramersPhotoIonizationCrossSection();
             pass[13] = testRadiativeRecombinationCrossSection();
             pass[14] = testRadiativeRecombinationRate();
+            pass[15] = testThreeBodyRecombinationAnalyticClosure();
 
             bool passTotal = true;
             for(uint8_t i = 0u; i < numberTests; ++i)
