@@ -29,12 +29,33 @@
 #include "picongpu/defines.hpp"
 #include "picongpu/particles/atomicPhysics/GetPhysicalEnergy.hpp"
 
+#include <pmacc/lockstep.hpp>
 #include <pmacc/particles/algorithm/ForEach.hpp>
 
 #include <cstdint>
 
 namespace picongpu::particles::atomicPhysics::kernel
 {
+    /** electron capture weight balance diagnostic
+     *
+     * Self contained on purpose: these are developer diagnostics of this kernel, not user facing parameters, so
+     *  they must not require a matching entry in every project's atomicPhysics_Debug.param.
+     *
+     * Enable with -DPARAM_OVERWRITES:LIST=-DPARAM_CHECK_ELECTRON_CAPTURE_BALANCE=1
+     */
+    namespace electronCaptureDebug
+    {
+#ifndef PARAM_CHECK_ELECTRON_CAPTURE_BALANCE
+#    define PARAM_CHECK_ELECTRON_CAPTURE_BALANCE 0
+#endif
+        //! verify removed weight == captured weight, and report clamping / MIN_WEIGHTING leakage
+        constexpr bool CHECK_WEIGHT_BALANCE = (PARAM_CHECK_ELECTRON_CAPTURE_BALANCE == 1);
+        //! relative mismatch above which a superCell is reported, unitless
+        constexpr float_X BALANCE_TOLERANCE = 1e-3;
+        //! report a captureFraction clamp, which after the tryReserve fix must never occur
+        constexpr bool REPORT_CLAMP = CHECK_WEIGHT_BALANCE;
+    } // namespace electronCaptureDebug
+
     /** apply electron capture kernel
      *
      * @attention assumes that the captured weight cache has been filled by the RecordChanges sub-stage previously
@@ -100,6 +121,8 @@ namespace picongpu::particles::atomicPhysics::kernel
             T_Histogram& histogram = electronHistogramDataBox(superCellFieldIdx);
             auto& capturedWeightCache = capturedWeightCacheBox(superCellFieldIdx);
 
+            namespace debugCapture = electronCaptureDebug;
+
             forEachLocalElectronBoxEntry(
                 [&histogram, &capturedWeightCache](T_Worker const& worker, auto& electron)
                 {
@@ -122,9 +145,21 @@ namespace picongpu::particles::atomicPhysics::kernel
                     if(weightBin <= 0._X)
                         return;
 
-                    /* over subscription handling guarantees capturedWeight <= deltaWeight <= weight0, clamp against
-                     *  float rounding */
-                    float_X const captureFraction = pmacc::math::min(capturedWeightBin / weightBin, 1._X);
+                    /* over subscription handling is supposed to guarantee
+                     *  capturedWeight <= deltaWeight <= weight0, clamp against float rounding */
+                    float_X const rawFraction = capturedWeightBin / weightBin;
+                    float_X const captureFraction = pmacc::math::min(rawFraction, 1._X);
+
+                    if constexpr(debugCapture::REPORT_CLAMP)
+                        if(rawFraction > 1._X)
+                        {
+                            /* capturedWeight exceeds the weight the bin ever held: the excess is silently not
+                             *  removed while the ions have already been recombined -> net electron creation */
+                            capturedWeightCache.addClampedWeight(
+                                worker,
+                                binIndex,
+                                (rawFraction - 1._X) * electron[weighting_]);
+                        }
 
                     float_X const newWeighting = electron[weighting_] * (1._X - captureFraction);
 
@@ -132,14 +167,73 @@ namespace picongpu::particles::atomicPhysics::kernel
                     {
                         /* mark macro electron for deletion, host side stage must call fillAllGaps() afterwards,
                          *  residual weight below MIN_WEIGHTING is accepted leakage */
+                        if constexpr(debugCapture::CHECK_WEIGHT_BALANCE)
+                        {
+                            // the whole macro particle disappears, so all of its weight is removed ...
+                            capturedWeightCache.addRemovedWeight(worker, binIndex, electron[weighting_]);
+                            // ... of which newWeighting was never meant to be captured
+                            capturedWeightCache.addDeletionResidual(worker, binIndex, newWeighting);
+                        }
                         electron[multiMask_] = 0;
                         return;
                     }
+
+                    if constexpr(debugCapture::CHECK_WEIGHT_BALANCE)
+                        capturedWeightCache.addRemovedWeight(
+                            worker,
+                            binIndex,
+                            electron[weighting_] * captureFraction);
 
                     electron[weighting_] = newWeighting;
                     // momentum is weight-scaled, rescale to keep the per physical electron energy unchanged
                     electron[momentum_] *= (1._X - captureFraction);
                 });
+
+            if constexpr(debugCapture::CHECK_WEIGHT_BALANCE)
+            {
+                worker.sync();
+
+                /* @attention with more than one atomicPhysics electron species this reports after each species,
+                 *  the totals are only meaningful after the last one */
+                auto onlyMaster = pmacc::lockstep::makeMaster(worker);
+                onlyMaster(
+                    [&capturedWeightCache, &superCellFieldIdx]()
+                    {
+                        float_X captured = 0._X;
+                        float_X removed = 0._X;
+                        float_X clamped = 0._X;
+                        float_X residual = 0._X;
+                        for(uint32_t binIndex = 0u; binIndex < T_Histogram::numberBins; ++binIndex)
+                        {
+                            captured += capturedWeightCache.getCapturedWeight(binIndex);
+                            removed += capturedWeightCache.getRemovedWeight(binIndex);
+                            clamped += capturedWeightCache.getClampedWeight(binIndex);
+                            residual += capturedWeightCache.getDeletionResidual(binIndex);
+                        }
+
+                        if(captured <= 0._X)
+                            return;
+
+                        float_X const relativeMismatch = (removed - captured) / captured;
+                        /* the clamp criterion must be relative: tryReserve leaves float rounding of order
+                         *  1e-16 * captured behind at the reservation boundary, which is not a real clamp */
+                        bool const report = (relativeMismatch > debugCapture::BALANCE_TOLERANCE)
+                            || (relativeMismatch < -debugCapture::BALANCE_TOLERANCE)
+                            || (clamped > debugCapture::BALANCE_TOLERANCE * captured);
+
+                        if(report)
+                            printf(
+                                "[electronCapture balance] superCell (%d,%d): captured %.6e removed %.6e "
+                                "mismatch %+.3e clamped %.6e minWeightResidual %.6e\n",
+                                static_cast<int>(superCellFieldIdx[0]),
+                                static_cast<int>(superCellFieldIdx[1]),
+                                static_cast<double>(captured),
+                                static_cast<double>(removed),
+                                static_cast<double>(relativeMismatch),
+                                static_cast<double>(clamped),
+                                static_cast<double>(residual));
+                    });
+            }
         }
     };
 } // namespace picongpu::particles::atomicPhysics::kernel

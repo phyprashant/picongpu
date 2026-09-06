@@ -589,8 +589,14 @@ namespace picongpu::simulation::stage
                     mappingDesc);
             }
 
+            /** @return number of IPD-ionization cascade iterations required
+             *
+             * Each iteration re-ionizes every ion whose atomic state IPD considers unbound and spawns the
+             *  corresponding free electrons. With recombination active this forms a
+             *  recombination <-> IPD-ionization cycle, so a persistently high count is the signature of that loop.
+             */
             template<bool T_SkipFinishedSuperCell, typename T_DeviceReduce>
-            HINLINE static void applyIPDIonization(
+            HINLINE static uint32_t applyIPDIonization(
                 picongpu::MappingDesc const& mappingDesc,
                 uint32_t const currentStep,
                 T_DeviceReduce& deviceReduce)
@@ -602,9 +608,11 @@ namespace picongpu::simulation::stage
                     = foundUnboundIonField.getGridLayout().sizeWithoutGuardND();
 
                 // ipd ionization loop, ends when no ion is in unbound state anymore
+                uint32_t numIPDIterations = 0u;
                 bool foundUnbound = true;
                 while(foundUnbound)
                 {
+                    ++numIPDIterations;
                     resetFoundUnboundIon(foundUnboundIonField);
                     calculateIPDInput(mappingDesc, currentStep);
                     picongpu::atomicPhysics::IPDModel::template applyIPDIonization<
@@ -620,6 +628,8 @@ namespace picongpu::simulation::stage
                         linearizedFoundUnboundIonBox,
                         fieldGridLayoutFoundUnbound.productOfComponents()));
                 } // end pressure ionization loop
+
+                return numIPDIterations;
             }
 
             /** apply all instant transition effects to macro ions
@@ -738,6 +748,7 @@ namespace picongpu::simulation::stage
                 uint64_t numSubSteps = 0u;
                 uint64_t numChooseTransitionIterations = 0u;
                 uint64_t numRejectionIterations = 0u;
+                uint64_t numIPDIonizationIterations = 0u;
 
                 // atomicPhysics sub-stepping loop
                 bool isSubSteppingComplete = false;
@@ -745,7 +756,7 @@ namespace picongpu::simulation::stage
                 {
                     ++numSubSteps;
                     debugForceConstantElectronTemperature(currentStep);
-                    applyIPDIonization</*skip finished super cells*/ true>(
+                    numIPDIonizationIterations += applyIPDIonization</*skip finished super cells*/ true>(
                         mappingDesc,
                         currentStep,
                         deviceLocalReduce);
@@ -804,13 +815,15 @@ namespace picongpu::simulation::stage
                     isSubSteppingComplete = isSubSteppingFinished(mappingDesc, deviceLocalReduce);
                 } // end atomicPhysics sub-stepping loop
 
+                // ensure no unbound states are visible to the rest of the loop
+                numIPDIonizationIterations
+                    += applyIPDIonization</*skip finished super cells*/ false>(mappingDesc, currentStep, deviceLocalReduce);
+
                 // temporary instrumentation output, one line per PIC step
                 std::cout << "[atomicPhysics instrumentation] step " << currentStep << ": subSteps=" << numSubSteps
                           << ", chooseTransitionIterations=" << numChooseTransitionIterations
-                          << ", rejectionIterations=" << numRejectionIterations << std::endl;
-
-                // ensure no unbound states are visible to the rest of the loop
-                applyIPDIonization</*skip finished super cells*/ false>(mappingDesc, currentStep, deviceLocalReduce);
+                          << ", rejectionIterations=" << numRejectionIterations
+                          << ", ipdIonizationIterations=" << numIPDIonizationIterations << std::endl;
             }
         };
 
