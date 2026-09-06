@@ -427,22 +427,38 @@ namespace picongpu::particles::atomicPhysics::kernel
                     uint32_t const newAtomicStateCollectionIndex
                         = transitionBox.lowerStateCollectionIndex(transitionIndex);
 
+                    uint32_t const binIndex = ion[binIndex_];
+                    float_X const weight = ion[weighting_];
+
+                    /* reserve the free electron weight this recombination consumes BEFORE committing the ion to
+                     *  its new atomic state.
+                     *
+                     * ApplyElectronCapture can only remove the weight the bin holds. Recombining the ion while the
+                     *  bin cannot supply the matching free electron weight leaves that weight in the simulation and
+                     *  creates charge, so a capture that does not fit is skipped entirely: the ion keeps its
+                     *  current state and may recombine in a later sub-step.
+                     *
+                     * @attention must stay in front of SetAtomicState and of the atomic energy ledger, so that the
+                     *  state change, the energy bookkeeping and the electron capture either all happen or none do */
+                    if constexpr(!picongpu::atomicPhysics::debug::fixedRateMatrix::
+                                     USE_FIXED_RATE_INSTEAD_OF_RATE_CALCULATION)
+                        if(!capturedWeightCache
+                                .tryReserve(worker, binIndex, weight, electronHistogram.getBinWeight0(binIndex)))
+                            return;
+
                     // update atomic state
                     picongpu::particles::atomicPhysics::SetAtomicState::op(
                         atomicStateBox,
                         ion,
                         newAtomicStateCollectionIndex);
 
-                    /* no energy accounting or electron capture if using fixed matrix
+                    /* no energy accounting if using fixed matrix
                      *
                      * @attention the atomic energy ledger below must stay on this side of the early return, so
                      *  that it only ever records exchanges whose counterpart also happened */
                     if constexpr(picongpu::atomicPhysics::debug::fixedRateMatrix::
                                      USE_FIXED_RATE_INSTEAD_OF_RATE_CALCULATION)
                         return;
-
-                    uint32_t const binIndex = ion[binIndex_];
-                    float_X const weight = ion[weighting_];
 
                     threadAtomicEnergy -= static_cast<float_64>(deltaEnergy) * static_cast<float_64>(weight);
 
@@ -453,8 +469,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                         binIndex,
                         (deltaEnergy + electronHistogram.getBinEnergy(binIndex)) * weight);
 
-                    // record captured weight for the electron capture sub-stage
-                    capturedWeightCache.add(worker, binIndex, weight);
+                    /* captured weight was already reserved in the cache above */
                 });
 
             // reduce the ledger contributions of this block, one global atomic per block instead of per macro ion
@@ -614,13 +629,28 @@ namespace picongpu::particles::atomicPhysics::kernel
                     uint32_t const newAtomicStateCollectionIndex
                         = transitionBox.lowerStateCollectionIndex(transitionIndex);
 
+                    /* reserve the free electron weight this recombination consumes BEFORE committing the ion to
+                     *  its new atomic state, see the equivalent reservation in the threeBodyRecombination kernel.
+                     *
+                     * Radiative recombination is outside the CollisionalBoundFreePairCap, which by construction
+                     *  only covers collisional ionization and its detailed balance inverse, so nothing else bounds
+                     *  how much electron weight it draws from a bin. */
+                    if constexpr(!picongpu::atomicPhysics::debug::fixedRateMatrix::
+                                     USE_FIXED_RATE_INSTEAD_OF_RATE_CALCULATION)
+                        if(!capturedWeightCache.tryReserve(
+                               worker,
+                               binIndex,
+                               ion[weighting_],
+                               electronHistogram.getBinWeight0(binIndex)))
+                            return;
+
                     // update atomic state
                     picongpu::particles::atomicPhysics::SetAtomicState::op(
                         atomicStateBox,
                         ion,
                         newAtomicStateCollectionIndex);
 
-                    /* no electron capture if using fixed matrix
+                    /* no energy accounting if using fixed matrix
                      *
                      * @attention the atomic energy ledger below must stay on this side of the early return, so
                      *  that it only ever records exchanges whose counterpart (the electron capture) also
@@ -638,8 +668,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                             + static_cast<float_64>(electronHistogram.getBinEnergy(binIndex)))
                         * weight;
 
-                    // record captured weight for the electron capture sub-stage
-                    capturedWeightCache.add(worker, binIndex, ion[weighting_]);
+                    /* captured weight was already reserved in the cache above */
                 });
 
             // reduce the ledger contributions of this block, one global atomic per block instead of per macro ion

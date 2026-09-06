@@ -46,6 +46,15 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
         // unitless (macro particle weighting)
         float_X capturedWeight[numberBins] = {0._X};
 
+        /* diagnostic accumulators, only written when
+         *  picongpu::atomicPhysics::debug::electronCapture::CHECK_WEIGHT_BALANCE is set */
+        //! weight actually removed from free electron macro particles, unitless
+        float_X removedWeight[numberBins] = {0._X};
+        //! capturedWeight in excess of the bin's weight0, lost to the captureFraction clamp, unitless
+        float_X clampedWeight[numberBins] = {0._X};
+        //! weight discarded by MIN_WEIGHTING macro particle deletion beyond the intended capture, unitless
+        float_X deletionResidual[numberBins] = {0._X};
+
         //! @attention only active by debug setting
         HDINLINE static bool outOfRangeBinIndex(uint32_t const binIndex)
         {
@@ -78,6 +87,119 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
                 &(this->capturedWeight[binIndex]),
                 weight,
                 ::alpaka::hierarchy::Threads{});
+        }
+
+        /** reserve captured weight against the weight the histogram bin actually holds
+         *
+         * Recombination consumes free electron weight from a bin. The ApplyElectronCapture sub-stage can only ever
+         *  remove the weight the bin holds, so a capture that would draw more than that is not realizable: the ion
+         *  would be recombined while the corresponding free electron weight stays in the simulation, creating
+         *  charge. Reserving here makes the invariant capturedWeight <= binWeight0 hold by construction, so the
+         *  caller must skip the transition when this returns false.
+         *
+         * @param binIndex index of electron histogram bin the weight is captured from
+         * @param weight captured weight to reserve, unitless
+         * @param capacity weight the bin holds, i.e. its weight0, unitless
+         *
+         * @return true if the weight was reserved, false if the bin cannot supply it
+         */
+        template<typename T_Worker>
+        HDINLINE bool tryReserve(
+            T_Worker const& worker,
+            uint32_t const binIndex,
+            float_X const weight,
+            float_X const capacity)
+        {
+            if(outOfRangeBinIndex(binIndex))
+                return false;
+
+            float_X const previous = alpaka::atomicAdd(
+                worker.getAcc(),
+                &(this->capturedWeight[binIndex]),
+                weight,
+                ::alpaka::hierarchy::Threads{});
+
+            if((previous + weight) > capacity)
+            {
+                // roll back, this bin cannot supply the requested weight
+                alpaka::atomicAdd(
+                    worker.getAcc(),
+                    &(this->capturedWeight[binIndex]),
+                    -weight,
+                    ::alpaka::hierarchy::Threads{});
+                return false;
+            }
+
+            return true;
+        }
+
+        /** add diagnostic weight to a cache entry, using atomics
+         *
+         * @param binIndex index of electron histogram bin
+         * @param weight weight to add, unitless
+         *
+         * @attention only called when CHECK_WEIGHT_BALANCE is set
+         */
+        template<typename T_Worker>
+        HDINLINE void addRemovedWeight(T_Worker const& worker, uint32_t const binIndex, float_X const weight)
+        {
+            if(outOfRangeBinIndex(binIndex))
+                return;
+            alpaka::atomicAdd(
+                worker.getAcc(),
+                &(this->removedWeight[binIndex]),
+                weight,
+                ::alpaka::hierarchy::Threads{});
+        }
+
+        //! @copydoc addRemovedWeight
+        template<typename T_Worker>
+        HDINLINE void addClampedWeight(T_Worker const& worker, uint32_t const binIndex, float_X const weight)
+        {
+            if(outOfRangeBinIndex(binIndex))
+                return;
+            alpaka::atomicAdd(
+                worker.getAcc(),
+                &(this->clampedWeight[binIndex]),
+                weight,
+                ::alpaka::hierarchy::Threads{});
+        }
+
+        //! @copydoc addRemovedWeight
+        template<typename T_Worker>
+        HDINLINE void addDeletionResidual(T_Worker const& worker, uint32_t const binIndex, float_X const weight)
+        {
+            if(outOfRangeBinIndex(binIndex))
+                return;
+            alpaka::atomicAdd(
+                worker.getAcc(),
+                &(this->deletionResidual[binIndex]),
+                weight,
+                ::alpaka::hierarchy::Threads{});
+        }
+
+        //! @return weight actually removed from free electrons for a bin, unitless
+        HDINLINE float_X getRemovedWeight(uint32_t const binIndex) const
+        {
+            if(outOfRangeBinIndex(binIndex))
+                return 0._X;
+            return removedWeight[binIndex];
+        }
+
+        //! @return weight lost to the captureFraction clamp for a bin, unitless
+        HDINLINE float_X getClampedWeight(uint32_t const binIndex) const
+        {
+            if(outOfRangeBinIndex(binIndex))
+                return 0._X;
+            return clampedWeight[binIndex];
+        }
+
+        //! @return weight lost to MIN_WEIGHTING deletion for a bin, unitless
+        HDINLINE float_X getDeletionResidual(uint32_t const binIndex) const
+        {
+            if(outOfRangeBinIndex(binIndex))
+                return 0._X;
+            return deletionResidual[binIndex];
         }
 
         /** get captured weight of a bin
