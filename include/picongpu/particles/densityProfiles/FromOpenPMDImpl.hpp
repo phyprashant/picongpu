@@ -125,10 +125,9 @@ namespace picongpu
                         % SpeciesType::FrameType::getName() % filename;
                     auto series
                         = ::openPMD::Series{filename, ::openPMD::Access::READ_ONLY, gc.getCommunicator().getMPIComm()};
-                    auto mesh = series.iterations[ParamClass::iteration].meshes[ParamClass::datasetName];
-                    ::openPMD::MeshRecordComponent dataset = mesh[::openPMD::RecordComponent::SCALAR];
+                    auto mesh = series.iterations[ParamClass::iteration].open().meshes[ParamClass::datasetName];
                     auto const indexConverter = IndexConverter{mesh};
-                    auto const datasetExtent = indexConverter.openPMDToXyz(dataset.getExtent());
+                    auto const datasetExtent = indexConverter.openPMDToXyz(mesh.getExtent());
 
                     // Offset of the local domain in file coordinates: global coordinates, no guards, no moving window
                     auto const& localDomain = Environment<simDim>::get().SubGrid().getLocalDomain();
@@ -157,12 +156,12 @@ namespace picongpu
                     auto data = std::shared_ptr<ValueType>{nullptr};
                     if(readFromFile)
                     {
-                        data = dataset.loadChunk<ValueType>(
+                        data = mesh.template loadChunk<ValueType>(
                             indexConverter.xyzToOpenPMD(chunkOffset),
                             indexConverter.xyzToOpenPMD(chunkExtent));
                     }
                     // This is MPI collective and so has to be done by all ranks
-                    series.flush();
+                    mesh.seriesFlush();
 
                     if(readFromFile)
                     {
