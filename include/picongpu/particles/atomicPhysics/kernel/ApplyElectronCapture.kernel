@@ -28,6 +28,7 @@
 
 #include "picongpu/defines.hpp"
 #include "picongpu/particles/atomicPhysics/GetPhysicalEnergy.hpp"
+#include "picongpu/particles/atomicPhysics/debug/ElectronCapture.hpp"
 
 #include <pmacc/lockstep.hpp>
 #include <pmacc/particles/algorithm/ForEach.hpp>
@@ -36,26 +37,6 @@
 
 namespace picongpu::particles::atomicPhysics::kernel
 {
-    /** electron capture weight balance diagnostic
-     *
-     * Self contained on purpose: these are developer diagnostics of this kernel, not user facing parameters, so
-     *  they must not require a matching entry in every project's atomicPhysics_Debug.param.
-     *
-     * Enable with -DPARAM_OVERWRITES:LIST=-DPARAM_CHECK_ELECTRON_CAPTURE_BALANCE=1
-     */
-    namespace electronCaptureDebug
-    {
-#ifndef PARAM_CHECK_ELECTRON_CAPTURE_BALANCE
-#    define PARAM_CHECK_ELECTRON_CAPTURE_BALANCE 0
-#endif
-        //! verify removed weight == captured weight, and report clamping / MIN_WEIGHTING leakage
-        constexpr bool CHECK_WEIGHT_BALANCE = (PARAM_CHECK_ELECTRON_CAPTURE_BALANCE == 1);
-        //! relative mismatch above which a superCell is reported, unitless
-        constexpr float_X BALANCE_TOLERANCE = 1e-3;
-        //! report a captureFraction clamp, which after the tryReserve fix must never occur
-        constexpr bool REPORT_CLAMP = CHECK_WEIGHT_BALANCE;
-    } // namespace electronCaptureDebug
-
     /** apply electron capture kernel
      *
      * @attention assumes that the captured weight cache has been filled by the RecordChanges sub-stage previously
@@ -121,7 +102,7 @@ namespace picongpu::particles::atomicPhysics::kernel
             T_Histogram& histogram = electronHistogramDataBox(superCellFieldIdx);
             auto& capturedWeightCache = capturedWeightCacheBox(superCellFieldIdx);
 
-            namespace debugCapture = electronCaptureDebug;
+            namespace debugCapture = picongpu::atomicPhysics::debug::electronCapture;
 
             forEachLocalElectronBoxEntry(
                 [&histogram, &capturedWeightCache](T_Worker const& worker, auto& electron)
@@ -150,7 +131,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                     float_X const rawFraction = capturedWeightBin / weightBin;
                     float_X const captureFraction = pmacc::math::min(rawFraction, 1._X);
 
-                    if constexpr(debugCapture::REPORT_CLAMP)
+                    if constexpr(debugCapture::CHECK_WEIGHT_BALANCE)
                         if(rawFraction > 1._X)
                         {
                             /* capturedWeight exceeds the weight the bin ever held: the excess is silently not
@@ -179,61 +160,137 @@ namespace picongpu::particles::atomicPhysics::kernel
                     }
 
                     if constexpr(debugCapture::CHECK_WEIGHT_BALANCE)
-                        capturedWeightCache.addRemovedWeight(
-                            worker,
-                            binIndex,
-                            electron[weighting_] * captureFraction);
+                        capturedWeightCache.addRemovedWeight(worker, binIndex, electron[weighting_] * captureFraction);
 
                     electron[weighting_] = newWeighting;
                     // momentum is weight-scaled, rescale to keep the per physical electron energy unchanged
                     electron[momentum_] *= (1._X - captureFraction);
                 });
-
-            if constexpr(debugCapture::CHECK_WEIGHT_BALANCE)
-            {
-                worker.sync();
-
-                /* @attention with more than one atomicPhysics electron species this reports after each species,
-                 *  the totals are only meaningful after the last one */
-                auto onlyMaster = pmacc::lockstep::makeMaster(worker);
-                onlyMaster(
-                    [&capturedWeightCache, &superCellFieldIdx]()
-                    {
-                        float_X captured = 0._X;
-                        float_X removed = 0._X;
-                        float_X clamped = 0._X;
-                        float_X residual = 0._X;
-                        for(uint32_t binIndex = 0u; binIndex < T_Histogram::numberBins; ++binIndex)
-                        {
-                            captured += capturedWeightCache.getCapturedWeight(binIndex);
-                            removed += capturedWeightCache.getRemovedWeight(binIndex);
-                            clamped += capturedWeightCache.getClampedWeight(binIndex);
-                            residual += capturedWeightCache.getDeletionResidual(binIndex);
-                        }
-
-                        if(captured <= 0._X)
-                            return;
-
-                        float_X const relativeMismatch = (removed - captured) / captured;
-                        /* the clamp criterion must be relative: tryReserve leaves float rounding of order
-                         *  1e-16 * captured behind at the reservation boundary, which is not a real clamp */
-                        bool const report = (relativeMismatch > debugCapture::BALANCE_TOLERANCE)
-                            || (relativeMismatch < -debugCapture::BALANCE_TOLERANCE)
-                            || (clamped > debugCapture::BALANCE_TOLERANCE * captured);
-
-                        if(report)
-                            printf(
-                                "[electronCapture balance] superCell (%d,%d): captured %.6e removed %.6e "
-                                "mismatch %+.3e clamped %.6e minWeightResidual %.6e\n",
-                                static_cast<int>(superCellFieldIdx[0]),
-                                static_cast<int>(superCellFieldIdx[1]),
-                                static_cast<double>(captured),
-                                static_cast<double>(removed),
-                                static_cast<double>(relativeMismatch),
-                                static_cast<double>(clamped),
-                                static_cast<double>(residual));
-                    });
-            }
         }
     };
+
+#if PARAM_CHECK_ELECTRON_CAPTURE_BALANCE == 1
+    //! Check all bins after capture has been applied to every electron species.
+    struct CheckElectronCaptureBalanceKernel
+    {
+        template<typename T_Worker, typename T_Mapper, typename T_TimeBox, typename T_CacheBox>
+        HDINLINE void operator()(
+            T_Worker const& worker,
+            T_Mapper const mapper,
+            T_TimeBox timeBox,
+            T_CacheBox cacheBox,
+            uint32_t const step,
+            uint64_t const subStep,
+            uint32_t const rank) const
+        {
+            auto const idx = mapper.getSuperCellIndex(worker.blockDomIdxND()) - mapper.getGuardingSuperCells();
+            if(timeBox(idx) <= 0._X)
+                return;
+            auto onlyMaster = pmacc::lockstep::makeMaster(worker);
+            onlyMaster(
+                [&]()
+                {
+                    auto const& cache = cacheBox(idx);
+                    using Cache = typename T_CacheBox::ValueType;
+
+                    int z = 0;
+                    if constexpr(simDim == 3)
+                        z = static_cast<int>(idx[2]);
+
+                    for(uint32_t bin = 0; bin < Cache::numberBins; ++bin)
+                    {
+                        float_X const captured = cache.getCapturedWeight(bin);
+                        float_X const removed = cache.getRemovedWeight(bin);
+                        float_X const clamped = cache.getClampedWeight(bin);
+                        float_X const residual = cache.getDeletionResidual(bin);
+                        uint32_t const rejected = cache.getRejectedReservations(bin);
+                        float_X const scale = pmacc::math::max(captured, removed);
+                        float_X const tolerance
+                            = picongpu::atomicPhysics::debug::electronCapture::BALANCE_TOLERANCE * scale;
+
+                        // Includes excess removal from MIN_WEIGHTING deletion.
+                        float_X const chargeDifference = removed - captured;
+                        float_X const unexplainedDifference = chargeDifference - residual;
+
+                        // Negated comparisons report NaNs as well as ordinary mismatches.
+                        bool const imbalance = !(
+                            unexplainedDifference <= tolerance && unexplainedDifference >= -tolerance
+                            && clamped <= tolerance && captured >= 0._X && removed >= 0._X);
+                        if(imbalance)
+                        {
+                            printf(
+                                "[electronCapture balance] step %u subStep %llu rank %u "
+                                "superCell (%d,%d,%d) bin %u: captured %.9e removed %.9e "
+                                "chargeDifference %+.9e minWeightResidual %.9e unexplainedDifference %+.9e "
+                                "clamped %.9e\n",
+                                step,
+                                static_cast<unsigned long long>(subStep),
+                                rank,
+                                static_cast<int>(idx[0]),
+                                static_cast<int>(idx[1]),
+                                z,
+                                bin,
+                                static_cast<double>(captured),
+                                static_cast<double>(removed),
+                                static_cast<double>(chargeDifference),
+                                static_cast<double>(residual),
+                                static_cast<double>(unexplainedDifference),
+                                static_cast<double>(clamped));
+                        }
+
+                        /* MIN_WEIGHTING deletion loss is intentional, accepted leakage(see ApplyElectronCapture
+                         *  kernel), so it does not by itself count as an imbalance above. Report it separately
+                         *  when it is not small, so a significant deletion loss is never invisible merely because
+                         *  it cancels out of unexplainedDifference. */
+                        if(residual > tolerance)
+                        {
+                            printf(
+                                "[electronCapture leakage] step %u subStep %llu rank %u "
+                                "superCell (%d,%d,%d) bin %u: minWeightResidual %.9e (MIN_WEIGHTING deletion, "
+                                "accepted)\n",
+                                step,
+                                static_cast<unsigned long long>(subStep),
+                                rank,
+                                static_cast<int>(idx[0]),
+                                static_cast<int>(idx[1]),
+                                z,
+                                bin,
+                                static_cast<double>(residual));
+                        }
+
+                        // Report reservation rejections separately from balance errors.
+                        if(rejected != 0u)
+                        {
+                            printf(
+                                "[electronCapture rejected] step %u subStep %llu rank %u "
+                                "superCell (%d,%d,%d) bin %u: rejected %u reservation(s)\n",
+                                step,
+                                static_cast<unsigned long long>(subStep),
+                                rank,
+                                static_cast<int>(idx[0]),
+                                static_cast<int>(idx[1]),
+                                z,
+                                bin,
+                                rejected);
+                        }
+                    }
+
+                    uint32_t const invalidBinIndexCalls = cache.getInvalidBinIndexCalls();
+                    if(invalidBinIndexCalls != 0u)
+                    {
+                        printf(
+                            "[electronCapture invalidIndex] step %u subStep %llu rank %u "
+                            "superCell (%d,%d,%d): %u call(s) with an out-of-range bin index\n",
+                            step,
+                            static_cast<unsigned long long>(subStep),
+                            rank,
+                            static_cast<int>(idx[0]),
+                            static_cast<int>(idx[1]),
+                            z,
+                            invalidBinIndexCalls);
+                    }
+                });
+        }
+    };
+#endif
 } // namespace picongpu::particles::atomicPhysics::kernel

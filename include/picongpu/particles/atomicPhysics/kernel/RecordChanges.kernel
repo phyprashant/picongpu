@@ -430,16 +430,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                     uint32_t const binIndex = ion[binIndex_];
                     float_X const weight = ion[weighting_];
 
-                    /* reserve the free electron weight this recombination consumes BEFORE committing the ion to
-                     *  its new atomic state.
-                     *
-                     * ApplyElectronCapture can only remove the weight the bin holds. Recombining the ion while the
-                     *  bin cannot supply the matching free electron weight leaves that weight in the simulation and
-                     *  creates charge, so a capture that does not fit is skipped entirely: the ion keeps its
-                     *  current state and may recombine in a later sub-step.
-                     *
-                     * @attention must stay in front of SetAtomicState and of the atomic energy ledger, so that the
-                     *  state change, the energy bookkeeping and the electron capture either all happen or none do */
+                    // Reserve before changing the ion state or energy ledger.
                     if constexpr(!picongpu::atomicPhysics::debug::fixedRateMatrix::
                                      USE_FIXED_RATE_INSTEAD_OF_RATE_CALCULATION)
                         if(!capturedWeightCache
@@ -629,12 +620,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                     uint32_t const newAtomicStateCollectionIndex
                         = transitionBox.lowerStateCollectionIndex(transitionIndex);
 
-                    /* reserve the free electron weight this recombination consumes BEFORE committing the ion to
-                     *  its new atomic state, see the equivalent reservation in the threeBodyRecombination kernel.
-                     *
-                     * Radiative recombination is outside the CollisionalBoundFreePairCap, which by construction
-                     *  only covers collisional ionization and its detailed balance inverse, so nothing else bounds
-                     *  how much electron weight it draws from a bin. */
+                    // Reserve before changing the ion state or energy ledger.
                     if constexpr(!picongpu::atomicPhysics::debug::fixedRateMatrix::
                                      USE_FIXED_RATE_INSTEAD_OF_RATE_CALCULATION)
                         if(!capturedWeightCache.tryReserve(

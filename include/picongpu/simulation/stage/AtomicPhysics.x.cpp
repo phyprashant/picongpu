@@ -73,6 +73,7 @@
 // debug only
 #include "picongpu/particles/atomicPhysics/debug/TestIonizationPotentialDepression.hpp"
 #include "picongpu/particles/atomicPhysics/debug/TestRateCalculation.hpp"
+#include "picongpu/particles/atomicPhysics/rateCalculation/ThreeBodyClosure.hpp"
 
 #include <iostream>
 
@@ -260,11 +261,12 @@ namespace picongpu::simulation::stage
             };
 
             //! reset SharedResourcesOverSubscribedField on device side
-            HINLINE static void resetSharedResourceOverSubscribed(picongpu::MappingDesc const& mappingDesc)
+            HINLINE static void resetSharedResourceOverSubscribed()
             {
-                picongpu::particles::atomicPhysics::stage::ResetSharedResources<T_numberAtomicPhysicsIonSpecies>{}(
-                    mappingDesc);
-            };
+                auto& dc = pmacc::Environment<>::get().DataConnector();
+                auto& flags = *dc.get<OverSubscribedField>("SharedResourcesOverSubscribedField");
+                flags.getDeviceBuffer().setValue(uint32_t{0});
+            }
 
             //! reset the captured weight cache on device side
             HINLINE static void resetCapturedWeightCache()
@@ -416,6 +418,8 @@ namespace picongpu::simulation::stage
             //! record all shared resources usage by accepted transitions
             HINLINE static void recordSuggestedChanges(picongpu::MappingDesc const& mappingDesc)
             {
+                // Reset before recording; preserve usage until the oversubscription check.
+                particles::atomicPhysics::stage::ResetSharedResources<T_numberAtomicPhysicsIonSpecies>{}(mappingDesc);
                 using ForEachIonSpeciesRecordSuggestedChanges = pmacc::meta::ForEach<
                     AtomicPhysicsIonSpecies,
                     particles::atomicPhysics::stage::RecordSuggestedChanges<boost::mpl::_1>>;
@@ -425,6 +429,10 @@ namespace picongpu::simulation::stage
             //! record all shared resources usage by accepted transitions
             HINLINE static void recordSuggestedFieldEnergyUse(picongpu::MappingDesc const& mappingDesc)
             {
+                // Reset before recording; preserve usage until the oversubscription check.
+                pmacc::DataConnector& dc = pmacc::Environment<>::get().DataConnector();
+                particles::atomicPhysics::stage::ResetSharedResources<T_numberAtomicPhysicsIonSpecies>::
+                    resetFieldEnergyUseCache(dc);
                 using ForEachIonSpeciesRecordSuggestedFieldEnergyUse = pmacc::meta::ForEach<
                     AtomicPhysicsIonSpecies,
                     particles::atomicPhysics::stage::RecordSuggestedFieldEnergyUse<boost::mpl::_1>>;
@@ -441,7 +449,7 @@ namespace picongpu::simulation::stage
                 T_SuperCellSharedResourcesOverSubscriptionField& perSuperCellSharedResourcesOverSubscriptionField,
                 T_DeviceReduce& deviceReduce)
             {
-                resetSharedResourceOverSubscribed(mappingDesc);
+                resetSharedResourceOverSubscribed();
                 picongpu::particles::atomicPhysics::stage::CheckForOverSubscription<T_numberAtomicPhysicsIonSpecies>{}(
                     mappingDesc);
 
@@ -483,7 +491,7 @@ namespace picongpu::simulation::stage
                 T_SuperCellSharedResourcesOverSubscriptionField& perSuperCellSharedResourcesOverSubscriptionField,
                 T_DeviceReduce& deviceReduce)
             {
-                resetSharedResourceOverSubscribed(mappingDesc);
+                resetSharedResourceOverSubscribed();
                 picongpu::particles::atomicPhysics::stage::CheckForFieldEnergyOverSubscription<
                     T_numberAtomicPhysicsIonSpecies>{}(mappingDesc);
 
@@ -560,7 +568,10 @@ namespace picongpu::simulation::stage
             }
 
             //! @attention assumes that all macro ions' choose a transition have been updated
-            HINLINE static void updateElectrons(picongpu::MappingDesc const& mappingDesc, uint32_t const currentStep)
+            HINLINE static void updateElectrons(
+                picongpu::MappingDesc const& mappingDesc,
+                uint32_t const currentStep,
+                uint64_t const subStep)
             {
                 /** @note ApplyElectronCapture must be called before DecelerateElectrons: electron energies are then
                  * still unchanged since the histogram binning, so the capture bin lookup matches the bin the
@@ -570,6 +581,9 @@ namespace picongpu::simulation::stage
                     AtomicPhysicsElectronSpecies,
                     particles::atomicPhysics::stage::ApplyElectronCapture<boost::mpl::_1>>;
                 ForEachElectronSpeciesApplyElectronCapture{}(mappingDesc);
+#if PARAM_CHECK_ELECTRON_CAPTURE_BALANCE == 1
+                particles::atomicPhysics::stage::checkElectronCaptureBalance(mappingDesc, currentStep, subStep);
+#endif
 
                 /** @note DecelerateElectrons must be called before SpawnIonizationElectrons such that we only
                  * change electrons that actually contributed to the histogram. It distributes each bin's energy
@@ -589,14 +603,22 @@ namespace picongpu::simulation::stage
                     mappingDesc);
             }
 
-            /** @return number of IPD-ionization cascade iterations required
-             *
-             * Each iteration re-ionizes every ion whose atomic state IPD considers unbound and spawns the
-             *  corresponding free electrons. With recombination active this forms a
-             *  recombination <-> IPD-ionization cycle, so a persistently high count is the signature of that loop.
-             */
+            //! Local IPD loop counts; activeIterations excludes the final empty pass.
+            struct IPDIterationCounts
+            {
+                uint64_t iterations = 0u;
+                uint64_t activeIterations = 0u;
+
+                HINLINE IPDIterationCounts& operator+=(IPDIterationCounts const& other)
+                {
+                    iterations += other.iterations;
+                    activeIterations += other.activeIterations;
+                    return *this;
+                }
+            };
+
             template<bool T_SkipFinishedSuperCell, typename T_DeviceReduce>
-            HINLINE static uint32_t applyIPDIonization(
+            HINLINE static IPDIterationCounts applyIPDIonization(
                 picongpu::MappingDesc const& mappingDesc,
                 uint32_t const currentStep,
                 T_DeviceReduce& deviceReduce)
@@ -608,11 +630,11 @@ namespace picongpu::simulation::stage
                     = foundUnboundIonField.getGridLayout().sizeWithoutGuardND();
 
                 // ipd ionization loop, ends when no ion is in unbound state anymore
-                uint32_t numIPDIterations = 0u;
+                IPDIterationCounts counts;
                 bool foundUnbound = true;
                 while(foundUnbound)
                 {
-                    ++numIPDIterations;
+                    ++counts.iterations;
                     resetFoundUnboundIon(foundUnboundIonField);
                     calculateIPDInput(mappingDesc, currentStep);
                     picongpu::atomicPhysics::IPDModel::template applyIPDIonization<
@@ -627,9 +649,10 @@ namespace picongpu::simulation::stage
                         pmacc::math::operation::Or(),
                         linearizedFoundUnboundIonBox,
                         fieldGridLayoutFoundUnbound.productOfComponents()));
+                    counts.activeIterations += static_cast<uint64_t>(foundUnbound);
                 } // end pressure ionization loop
 
-                return numIPDIterations;
+                return counts;
             }
 
             /** apply all instant transition effects to macro ions
@@ -748,7 +771,7 @@ namespace picongpu::simulation::stage
                 uint64_t numSubSteps = 0u;
                 uint64_t numChooseTransitionIterations = 0u;
                 uint64_t numRejectionIterations = 0u;
-                uint64_t numIPDIonizationIterations = 0u;
+                IPDIterationCounts numIPDIonizationIterations;
 
                 // atomicPhysics sub-stepping loop
                 bool isSubSteppingComplete = false;
@@ -809,21 +832,24 @@ namespace picongpu::simulation::stage
 
                     resetCapturedWeightCache();
                     recordChanges(mappingDesc);
-                    updateElectrons(mappingDesc, currentStep);
+                    updateElectrons(mappingDesc, currentStep, numSubSteps);
                     updateElectricField(mappingDesc);
                     updateTimeRemaining(mappingDesc);
                     isSubSteppingComplete = isSubSteppingFinished(mappingDesc, deviceLocalReduce);
                 } // end atomicPhysics sub-stepping loop
 
                 // ensure no unbound states are visible to the rest of the loop
-                numIPDIonizationIterations
-                    += applyIPDIonization</*skip finished super cells*/ false>(mappingDesc, currentStep, deviceLocalReduce);
+                numIPDIonizationIterations += applyIPDIonization</*skip finished super cells*/ false>(
+                    mappingDesc,
+                    currentStep,
+                    deviceLocalReduce);
 
                 // temporary instrumentation output, one line per PIC step
                 std::cout << "[atomicPhysics instrumentation] step " << currentStep << ": subSteps=" << numSubSteps
                           << ", chooseTransitionIterations=" << numChooseTransitionIterations
                           << ", rejectionIterations=" << numRejectionIterations
-                          << ", ipdIonizationIterations=" << numIPDIonizationIterations << std::endl;
+                          << ", ipdIonizationIterations=" << numIPDIonizationIterations.iterations
+                          << ", ipdActiveIterations=" << numIPDIonizationIterations.activeIterations << std::endl;
             }
         };
 
@@ -886,6 +912,15 @@ namespace picongpu::simulation::stage
         {
             log<picLog::PHYSICS>(
                 "[atomicPhysics WARNING]: (using DEBUG ONLY feature), using fixed rate matrix, per user direction.");
+        }
+
+        if constexpr(!picongpu::particles::atomicPhysics::rateCalculation::useAnalyticThreeBodyClosure)
+        {
+            log<picLog::PHYSICS>(
+                "[atomicPhysics WARNING]: PARAM_ATOMIC_PHYSICS_3BR_ANALYTIC_CLOSURE=0, using the historic "
+                "three-body recombination closure (capped Saha factor times the sampled histogram EII sum). This "
+                "is identically zero wherever the sampled ionization tail is empty; kept only to reproduce "
+                "pre-fix results, do not use for production.");
         }
 
         if constexpr(picongpu::atomicPhysics::debug::rateCalculation::RUN_UNIT_TESTS)

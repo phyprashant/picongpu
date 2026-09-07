@@ -92,4 +92,24 @@ namespace picongpu::particles::atomicPhysics::stage
             electrons.fillAllGaps();
         }
     };
+#if PARAM_CHECK_ELECTRON_CAPTURE_BALANCE == 1
+    HINLINE void checkElectronCaptureBalance(
+        picongpu::MappingDesc const& mappingDesc,
+        uint32_t const step,
+        uint64_t const subStep)
+    {
+        pmacc::AreaMapping<CORE + BORDER, MappingDesc> mapper(mappingDesc);
+        auto& dc = pmacc::Environment<>::get().DataConnector();
+        auto& time = *dc.get<localHelperFields::TimeRemainingField<MappingDesc>>("TimeRemainingField");
+        auto& cache = *dc.get<localHelperFields::CapturedWeightCacheField<MappingDesc>>("CapturedWeightCacheField");
+        PMACC_LOCKSTEP_KERNEL(kernel::CheckElectronCaptureBalanceKernel())
+            .config<1u>(mapper.getGridDim())(
+                mapper,
+                time.getDeviceDataBox(),
+                cache.getDeviceDataBox(),
+                step,
+                subStep,
+                static_cast<uint32_t>(pmacc::Environment<>::get().GridController().getGlobalRank()));
+    }
+#endif
 } // namespace picongpu::particles::atomicPhysics::stage

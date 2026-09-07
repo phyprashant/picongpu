@@ -20,9 +20,11 @@
 #pragma once
 
 #include "picongpu/defines.hpp"
+#include "picongpu/particles/atomicPhysics/debug/ElectronCapture.hpp"
 #include "picongpu/particles/atomicPhysics/debug/param.hpp"
 
 #include <cstdint>
+#include <limits>
 
 namespace picongpu::particles::atomicPhysics::localHelperFields
 {
@@ -46,19 +48,30 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
         // unitless (macro particle weighting)
         float_X capturedWeight[numberBins] = {0._X};
 
-        /* diagnostic accumulators, only written when
-         *  picongpu::atomicPhysics::debug::electronCapture::CHECK_WEIGHT_BALANCE is set */
+#if PARAM_CHECK_ELECTRON_CAPTURE_BALANCE == 1
         //! weight actually removed from free electron macro particles, unitless
         float_X removedWeight[numberBins] = {0._X};
         //! capturedWeight in excess of the bin's weight0, lost to the captureFraction clamp, unitless
         float_X clampedWeight[numberBins] = {0._X};
         //! weight discarded by MIN_WEIGHTING macro particle deletion beyond the intended capture, unitless
         float_X deletionResidual[numberBins] = {0._X};
+        //! failed reservation attempts, including requests too small to represent
+        uint32_t rejectedReservations[numberBins] = {};
+        //! invalid-index calls across all bins
+        uint32_t invalidBinIndexCalls = 0u;
+#endif
 
-        //! @attention only active by debug setting
+        /** @attention only active by debug setting
+         *
+         * Active under either BIN_INDEX_RANGE_CHECK or CHECK_WEIGHT_BALANCE: the latter's invalid-index counter
+         *  (see getInvalidBinIndexCalls()) would otherwise never see an out-of-range call unless the unrelated
+         *  BIN_INDEX_RANGE_CHECK switch is also enabled.
+         */
         HDINLINE static bool outOfRangeBinIndex(uint32_t const binIndex)
         {
-            if constexpr(picongpu::atomicPhysics::debug::rejectionProbabilityCache::BIN_INDEX_RANGE_CHECK)
+            if constexpr(
+                picongpu::atomicPhysics::debug::rejectionProbabilityCache::BIN_INDEX_RANGE_CHECK
+                || picongpu::atomicPhysics::debug::electronCapture::CHECK_WEIGHT_BALANCE)
                 if(binIndex >= numberBins)
                 {
                     printf("atomicPhysics ERROR: out of range bin index in call to CapturedWeightCache\n");
@@ -68,34 +81,9 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
         }
 
     public:
-        /** add captured weight to cache entry, using atomics
-         *
-         * @param worker object containing the device and block information
-         * @param binIndex index of electron histogram bin the weight is captured from
-         * @param weight captured weight, unitless
-         *
-         * @attention no range checks outside a debug compile, invalid memory write on failure
-         */
-        template<typename T_Worker>
-        HDINLINE void add(T_Worker const& worker, uint32_t const binIndex, float_X const weight)
-        {
-            if(outOfRangeBinIndex(binIndex))
-                return;
-
-            alpaka::atomicAdd(
-                worker.getAcc(),
-                &(this->capturedWeight[binIndex]),
-                weight,
-                ::alpaka::hierarchy::Threads{});
-        }
-
         /** reserve captured weight against the weight the histogram bin actually holds
          *
-         * Recombination consumes free electron weight from a bin. The ApplyElectronCapture sub-stage can only ever
-         *  remove the weight the bin holds, so a capture that would draw more than that is not realizable: the ion
-         *  would be recombined while the corresponding free electron weight stays in the simulation, creating
-         *  charge. Reserving here makes the invariant capturedWeight <= binWeight0 hold by construction, so the
-         *  caller must skip the transition when this returns false.
+         * The caller must skip the transition if reservation fails.
          *
          * @param binIndex index of electron histogram bin the weight is captured from
          * @param weight captured weight to reserve, unitless
@@ -111,26 +99,70 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
             float_X const capacity)
         {
             if(outOfRangeBinIndex(binIndex))
-                return false;
-
-            float_X const previous = alpaka::atomicAdd(
-                worker.getAcc(),
-                &(this->capturedWeight[binIndex]),
-                weight,
-                ::alpaka::hierarchy::Threads{});
-
-            if((previous + weight) > capacity)
             {
-                // roll back, this bin cannot supply the requested weight
+#if PARAM_CHECK_ELECTRON_CAPTURE_BALANCE == 1
                 alpaka::atomicAdd(
                     worker.getAcc(),
-                    &(this->capturedWeight[binIndex]),
-                    -weight,
+                    &invalidBinIndexCalls,
+                    1u,
                     ::alpaka::hierarchy::Threads{});
+#endif
                 return false;
             }
 
-            return true;
+            // Reject invalid requests without ever modifying the committed captured weight.
+            auto reject = [&]()
+            {
+#if PARAM_CHECK_ELECTRON_CAPTURE_BALANCE == 1
+                alpaka::atomicAdd(
+                    worker.getAcc(),
+                    &rejectedReservations[binIndex],
+                    1u,
+                    ::alpaka::hierarchy::Threads{});
+#endif
+                return false;
+            };
+            if(!(weight > 0._X) || !(weight <= capacity) || !(capacity <= std::numeric_limits<float_X>::max()))
+                return reject();
+
+            // Atomic read: other workers may already be reserving from this bin.
+            float_X previous = alpaka::atomicCas(
+                worker.getAcc(),
+                &capturedWeight[binIndex],
+                0._X,
+                0._X,
+                ::alpaka::hierarchy::Threads{});
+            while(true)
+            {
+                float_X const next = previous + weight;
+                // The subtraction check also rejects a request rounded down to capacity.
+                // Do not commit an ion transition if its weight disappears in rounding.
+                if(!(previous >= 0._X) || !(weight <= capacity - previous) || !(next > previous)
+                   || !(next <= capacity))
+                    return reject();
+
+                float_X const observed = alpaka::atomicCas(
+                    worker.getAcc(),
+                    &capturedWeight[binIndex],
+                    previous,
+                    next,
+                    ::alpaka::hierarchy::Threads{});
+                if(observed == previous)
+                    return true;
+                previous = observed;
+            }
+        }
+
+#if PARAM_CHECK_ELECTRON_CAPTURE_BALANCE == 1
+        HDINLINE uint32_t getRejectedReservations(uint32_t const binIndex) const
+        {
+            return rejectedReservations[binIndex];
+        }
+
+        //! @return number of invalid-index calls
+        HDINLINE uint32_t getInvalidBinIndexCalls() const
+        {
+            return invalidBinIndexCalls;
         }
 
         /** add diagnostic weight to a cache entry, using atomics
@@ -144,7 +176,10 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
         HDINLINE void addRemovedWeight(T_Worker const& worker, uint32_t const binIndex, float_X const weight)
         {
             if(outOfRangeBinIndex(binIndex))
+            {
+                alpaka::atomicAdd(worker.getAcc(), &invalidBinIndexCalls, 1u, ::alpaka::hierarchy::Threads{});
                 return;
+            }
             alpaka::atomicAdd(
                 worker.getAcc(),
                 &(this->removedWeight[binIndex]),
@@ -157,7 +192,10 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
         HDINLINE void addClampedWeight(T_Worker const& worker, uint32_t const binIndex, float_X const weight)
         {
             if(outOfRangeBinIndex(binIndex))
+            {
+                alpaka::atomicAdd(worker.getAcc(), &invalidBinIndexCalls, 1u, ::alpaka::hierarchy::Threads{});
                 return;
+            }
             alpaka::atomicAdd(
                 worker.getAcc(),
                 &(this->clampedWeight[binIndex]),
@@ -170,7 +208,10 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
         HDINLINE void addDeletionResidual(T_Worker const& worker, uint32_t const binIndex, float_X const weight)
         {
             if(outOfRangeBinIndex(binIndex))
+            {
+                alpaka::atomicAdd(worker.getAcc(), &invalidBinIndexCalls, 1u, ::alpaka::hierarchy::Threads{});
                 return;
+            }
             alpaka::atomicAdd(
                 worker.getAcc(),
                 &(this->deletionResidual[binIndex]),
@@ -201,6 +242,8 @@ namespace picongpu::particles::atomicPhysics::localHelperFields
                 return 0._X;
             return deletionResidual[binIndex];
         }
+
+#endif
 
         /** get captured weight of a bin
          *
