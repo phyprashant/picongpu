@@ -96,9 +96,16 @@ class PicBuildFlags(BaseModel):
     # We explicitly disallow the some shorthands like `-c`, `-t`, ...
     # because they overlap with tbg flags and could thus lead to confusion.
     jobs: int | None = Field(
-        default=4,
+        # NOTE: This flat `build_jobs` config key is not the same as the
+        # nested `[dependencies] jobs` setting (compile parallelism for
+        # dependency builds) -- config docs should keep the two distinct.
+        default_factory=lambda: rc_params.get("build_jobs", 4),
         description="allow N jobs at once; infinite jobs if set to None",
         validation_alias=AliasChoices("jobs", "j"),
+        # `default_factory` results are not validated by default; validate so a
+        # mis-typed `build_jobs` in picongpurc.toml is caught like an explicit
+        # `PicBuildFlags(jobs=...)` argument would be.
+        validate_default=True,
     )
 
     cmake: str | None = Field(
@@ -222,7 +229,7 @@ class Runner(BaseModel):
         logging.info("    setup dir: {}".format(self.setup_dir))
         logging.info("      run dir: {}".format(self.run_dir))
 
-    def _render_templates(self):
+    def _render_templates(self, exist_ok=False):
         """
         render the templates in the setup dir into a picongpu input
 
@@ -238,7 +245,7 @@ class Runner(BaseModel):
         # dump checked context
         self.store_metadata(context, filename="pypicongpu_rendering_context.json")
         # preprocess (floats to str, add _special properties, ...)
-        Renderer.render_directory(Renderer.get_context_preprocessed(context), str(self.setup_dir))
+        Renderer.render_directory(Renderer.get_context_preprocessed(context), str(self.setup_dir), exist_ok=exist_ok)
 
     @property
     def metadata_path(self):
@@ -331,6 +338,12 @@ class Runner(BaseModel):
                         "cp -r tbg_link tbg",
                         'submission_script="./tbg/submit.start"',
                         'submission_cmd="$1"',
+                        # This step runs in isolation: its working directory is
+                        # cwltool's per-step job cache dir, so resolve
+                        # TBG_dstPath/--chdir to that directory (its own pwd).
+                        # The step must not reach outside itself; the final run
+                        # directory is made to look self-contained later, by the
+                        # organize_output step stripping the cache reference.
                         'sed -i "s|TBG_dstPath=.*|TBG_dstPath=$(pwd -P)|" "$submission_script"',
                         'sed -i "s|--chdir=.*|--chdir=$(pwd -P)|" "$submission_script"',
                         r"""
@@ -410,7 +423,11 @@ class Runner(BaseModel):
                 "setup directory must not exist before generation -- did you call generate() already?"
             )
         preset = rc_params.preset_dir
-        copytree(core.path("etc") / f"picongpu/{preset}", self.setup_dir / f"etc/picongpu/{preset}")
+        copytree(
+            core.path("etc") / f"picongpu/{preset}",
+            self.setup_dir / f"etc/picongpu/{preset}",
+            dirs_exist_ok=exist_ok,
+        )
         for path in (core.path("etc") / "picongpu").iterdir():
             if path.is_file():
                 copy2(path, self.setup_dir / f"etc/picongpu/{path.name}")
@@ -429,13 +446,13 @@ class Runner(BaseModel):
         self.generate_prepare_submission_command()
         self.generate_submission_command()
 
-        self._render_templates()
+        self._render_templates(exist_ok=exist_ok)
 
         self.generate_workflow_input(
             build_flags=PicBuildFlags(**flags),
             run_flags=TBGFlags(project_path=self.setup_dir, **flags),
         )
-        self.cwl_cachedir.mkdir(parents=True)
+        self.cwl_cachedir.mkdir(parents=True, exist_ok=True)
 
         self.store_metadata(self.model_dump(mode="json"), filename="pypicongpu_runner.json")
         self.store_metadata(rc_params.model_dump(mode="json"), filename="rc_params.json")
