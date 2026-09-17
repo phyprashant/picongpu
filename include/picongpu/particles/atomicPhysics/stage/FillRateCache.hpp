@@ -165,6 +165,7 @@ namespace picongpu::particles::atomicPhysics::stage
             if constexpr(AtomicDataType::switchElectronicIonization || AtomicDataType::switchFieldIonization)
             {
                 auto& eField = *dc.get<FieldE>(FieldE::getName());
+                auto& ions = *dc.get<IonSpecies>(IonSpecies::FrameType::getName());
 
                 using FillRateCacheUpWardBoundFree = kernel::FillRateCacheKernel_BoundFree<
                     IPDModel,
@@ -185,6 +186,7 @@ namespace picongpu::particles::atomicPhysics::stage
                     rateCacheField->getDeviceDataBox(),
                     electronHistogramField->getDeviceDataBox(),
                     eField.getDeviceDataBox(),
+                    ions.getDeviceParticlesBox(),
                     atomicData->template getChargeStateDataDataBox<false>(),
                     atomicData->template getAtomicStateDataDataBox<false>(),
                     atomicData->template getBoundFreeStartIndexBlockDataBox<false>(),

@@ -38,6 +38,8 @@
 #include <pmacc/lockstep/ForEach.hpp>
 #include <pmacc/memory/shared/Allocate.hpp>
 #include <pmacc/static_assert.hpp>
+#include <pmacc/particles/algorithm/ForEach.hpp>
+#include <pmacc/memory/Array.hpp>
 
 #include <cstdint>
 #include <limits>
@@ -196,6 +198,7 @@ namespace picongpu::particles::atomicPhysics::kernel
         template<
             typename T_Worker,
             typename T_RateCache,
+            typename T_IonBox,
             typename T_EFieldDataBox,
             typename T_ChargeStateDataDataBox,
             typename T_AtomicStateDataDataBox,
@@ -205,6 +208,7 @@ namespace picongpu::particles::atomicPhysics::kernel
         HDINLINE static void fillWithFieldIonization(
             T_Worker const& worker,
             VectorIdx superCellIdx,
+            T_IonBox const ionBox,
             T_RateCache& rateCache,
             T_EFieldDataBox const eFieldBox,
             T_ChargeStateDataDataBox const chargeStateDataDataBox,
@@ -227,10 +231,45 @@ namespace picongpu::particles::atomicPhysics::kernel
                 maxEFieldNormSuperCell);
             worker.sync();
 
+            // Maximum SUM of local rates over ions actually occupying each state. Field and ion positions
+            // remain unchanged between cache construction and regular transition selection, including retries.
+            // Do not apply the full-weight energy gate here: retaining rates of ineligible ions is conservative.
+            PMACC_SMEM(worker, localFieldBounds, memory::Array<float_X, T_numberAtomicStates>);
+            auto initLocalBounds = pmacc::lockstep::makeForEach<T_numberAtomicStates, T_Worker>(worker);
+            initLocalBounds([&](uint32_t const state) { localFieldBounds[state] = 0._X; });
+            worker.sync();
+            auto eachIon = pmacc::particles::algorithm::acc::makeForEach(worker, ionBox, superCellIdx);
+            eachIon([&](T_Worker const& w, auto& ion) {
+                auto const state = ion[atomicStateCollectionIndex_];
+                auto const cell = pmacc::math::mapToND(picongpu::SuperCellSize::toRT(),
+                    static_cast<int>(ion[localCellIdx_]));
+                auto const field = pmacc::math::l2norm(eFieldBox(superCellIdx * picongpu::SuperCellSize::toRT() + cell));
+                auto const ipd = ionizationPotentialDepression::template getIPD<T_IPDModel>(
+                    atomicStateDataDataBox, state, superCellConstantIPDInput);
+                auto const offset = startIndexDataBox.startIndexBlockTransitionsUp(state);
+                constexpr auto limit = InstantTransitionRateLimit::get<float_X>();
+                float_X sum = 0._X;
+                for(uint32_t t = 0u; t < numberTransitionsDataBox.numberOfTransitionsUp(state); ++t)
+                {
+                    auto const rate = atomicPhysics::rateCalculation::BoundFreeFieldTransitionRates<T_ADKLaserPolarization>::
+                        template rateADKFieldIonization<float_X>(field, ipd, offset + t,
+                            chargeStateDataDataBox, atomicStateDataDataBox, boundFreeTransitionDataBox);
+                    // Preserve the legacy instant-rate policy for overflow, NaN, or above-limit local rates.
+                    if(!(rate >= 0._X && rate <= limit) || sum > limit - rate)
+                    {
+                        sum = std::numeric_limits<float_X>::max();
+                        break;
+                    }
+                    sum += rate;
+                }
+                alpaka::atomicMax(w.getAcc(), &localFieldBounds[state], sum, ::alpaka::hierarchy::Threads{});
+            });
+            worker.sync();
             // calculate maximum ADK field ionization rate for each atomic state
             auto forEachAtomicState = pmacc::lockstep::makeForEach<T_numberAtomicStates, T_Worker>(worker);
             forEachAtomicState(
                 [&superCellConstantIPDInput,
+                 &localFieldBounds,
                  &minEFieldNormSuperCell,
                  &maxEFieldNormSuperCell,
                  &rateCache,
@@ -244,6 +283,17 @@ namespace picongpu::particles::atomicPhysics::kernel
                     if(!rateCache.present(atomicStateCollectionIndex))
                         return;
 
+                    auto const localBound = localFieldBounds[atomicStateCollectionIndex];
+                    constexpr auto localLimit = InstantTransitionRateLimit::get<float_X>();
+                    // Small upward margin protects against arithmetic differences in the selector's sum.
+                    auto const paddedBound = localBound * (1._X + 16._X * std::numeric_limits<float_X>::epsilon());
+                    if(paddedBound <= localLimit)
+                    {
+                        rateCache.template add<s_enums::ChooseTransitionGroup::fieldBoundFreeUpward>(
+                            atomicStateCollectionIndex, paddedBound);
+                        return;
+                    }
+                    // Otherwise retain the original supercell-range bound and instant-rate cap below.
                     uint32_t const numberTransitionsUp
                         = numberTransitionsDataBox.numberOfTransitionsUp(atomicStateCollectionIndex);
                     uint32_t const offset = startIndexDataBox.startIndexBlockTransitionsUp(atomicStateCollectionIndex);
@@ -329,6 +379,7 @@ namespace picongpu::particles::atomicPhysics::kernel
             typename T_LocalRateCacheBox,
             typename T_LocalElectronHistogramDataBox,
             typename T_EFieldDataBox,
+            typename T_IonBox,
             typename T_ChargeStateDataDataBox,
             typename T_AtomicStateDataDataBox,
             typename T_AtomicStateStartIndexBox,
@@ -344,6 +395,7 @@ namespace picongpu::particles::atomicPhysics::kernel
             [[maybe_unused]] T_LocalElectronHistogramDataBox const electronHistogramDataBox,
             // Only used when field ionization is active:
             [[maybe_unused]] T_EFieldDataBox const eFieldBox,
+            T_IonBox const ionBox,
             // The rest is only used when at least one form of ionization is activated but I'd argue that NOT having
             // at least one active when calling this is likely enough to be a bug to not tag them with
             // [[maybe_unused]].
@@ -401,6 +453,7 @@ namespace picongpu::particles::atomicPhysics::kernel
                 fillWithFieldIonization(
                     worker,
                     superCellIdx,
+                    ionBox,
                     rateCache,
                     eFieldBox,
                     chargeStateDataDataBox,
