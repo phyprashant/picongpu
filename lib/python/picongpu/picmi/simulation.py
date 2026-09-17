@@ -14,7 +14,7 @@ from itertools import chain, groupby
 from os import PathLike
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import picmistandard
 from pydantic import AfterValidator, BeforeValidator, BaseModel, ConfigDict, Field, PrivateAttr, model_validator
@@ -199,6 +199,14 @@ class Simulation(picmistandard.PICMI_Simulation):
     picongpu_base_density: float | None = Field(default=None)
     """value to normalise densities with"""
 
+    picongpu_precision: Literal[32, 64] = Field(default=32)
+    """
+    floating point precision of the simulation core (see ``precision.param``)
+
+    32 (single precision, default) or 64 (double precision). Controls the
+    ``precisionPIConGPU`` namespace in the generated ``precision.param``.
+    """
+
     picongpu_walltime: datetime.timedelta | None = Field(default=None)
     """time after which the cluster scheduler will stop the simulation"""
 
@@ -210,8 +218,7 @@ class Simulation(picmistandard.PICMI_Simulation):
 
     @model_validator(mode="after")
     def _post_init(self):
-        # additional PICMI stuff checks, @todo move to picmistandard, Brian Marre, 2024
-        ## throw if both cfl & delta_t are set
+        # cross-check cfl against delta_t, deriving whichever is missing
         if (
             self.solver is not None
             and self.solver.method in ["Yee", "Lehe"]
@@ -333,6 +340,7 @@ class Simulation(picmistandard.PICMI_Simulation):
                         else PyPIConGPUFieldDump(
                             name=diagnostic.fieldname,
                             filtername=diagnostic.filtername,
+                            species_name=None if isinstance(diagnostic, NativeFieldDump) else diagnostic.species_name,
                             functor=None
                             if isinstance(diagnostic, NativeFieldDump)
                             else diagnostic.functor.get_as_pypicongpu(mode="DerivedField"),
@@ -440,6 +448,7 @@ class Simulation(picmistandard.PICMI_Simulation):
             base_density=self._get_base_density(),
             synchrotron_params=synchrotron_params[0],
             collisional_physics=collisions[0].get_as_pypicongpu(),
+            precision=self.picongpu_precision,
         )
 
     def _get_base_density(self) -> float:
