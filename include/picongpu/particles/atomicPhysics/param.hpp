@@ -24,4 +24,5 @@
 // clang-format off
 #include "picongpu/particles/atomicPhysics/IPDModel.param"
 #include "picongpu/param/atomicPhysics.param"
+#include "picongpu/param/particleMerging.param"
 // clang-format on

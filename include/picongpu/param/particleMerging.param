@@ -1,0 +1,96 @@
+/* Copyright 2026 Prashant Sharma
+ *
+ * This file is part of PIConGPU.
+ *
+ * PIConGPU is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * PIConGPU is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with PIConGPU.
+ * If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/** @file configuration of atomicPhysics macro electron merging
+ *
+ * Ionization spawns one macro electron per ionization event while electron capture only thins the weight of
+ *  existing macro electrons, so ionization <-> recombination cycling grows the macro electron count without bound.
+ *  Once per PIC step, after the atomicPhysics sub-stepping, macro electrons of a superCell are merged N->2 within
+ *  groups of equal (cell, electron histogram energy bin, momentum direction sextant). The merge conserves weight,
+ *  momentum and kinetic energy exactly and keeps every survivor in the energy bin of its group, so the electron
+ *  histogram, and thereby every atomicPhysics rate, is unchanged by it.
+ */
+
+#pragma once
+
+#include <cstdint>
+
+namespace picongpu::atomicPhysics::merging
+{
+    struct MergeElectronsParam
+    {
+        //! false =^= merging is compiled out entirely
+        static constexpr bool enabled = true;
+
+        /** merge a superCell only if it holds more macro electrons than this many per cell on average
+         *
+         * Without recombination the macro electron count of a cell is bounded by
+         *  (max charge state) * (macro ions per cell), one macro electron per ionization event of a macro ion.
+         *  Twice that bound is a good default for this trigger.
+         */
+        static constexpr uint32_t triggerMacroParticlesPerCell = 256u;
+
+        /** number of merge groups a superCell can hold open in one pass, power of two
+         *
+         * The table lives in shared memory and costs tableSize * sizeof(MergeGroup), 64 byte per entry in 2D and
+         *  72 in 3D. 256 entries is therefore ~16 KiB, which still leaves room for a second block per SM against
+         *  the 47 KiB of ALPAKA_BLOCK_SHARED_DYN_MEMBER_ALLOC_KIB; 512 entries (~33 KiB) allows only one.
+         *
+         * Cells of a superCell take turns being merge eligible so that the groups of the eligible cells fit,
+         *  see `rotation` in MergeElectronsKernel. A larger table merges more cells per step and therefore holds
+         *  the count closer to its floor, at the cost of occupancy.
+         */
+        static constexpr uint32_t tableSize = 256u;
+
+        /** expected number of distinct (energy bin, sextant) groups a populated cell holds
+         *
+         * Only used to decide how many cells are merge eligible per step. The hard upper bound is
+         *  numberBins * 6 = 600 for the default 100 bin histogram, but a thermal cell spans ~20-30 log energy
+         *  bins, so ~150-200 is the realistic value. Too low over-subscribes the table, whose overflow is
+         *  then left unmerged that step, too high merges fewer cells per step than it could.
+         */
+        static constexpr uint32_t estimatedGroupsPerCell = 192u;
+
+        //! linear probing limit of the group table, particles of a group not found within the limit are skipped
+        static constexpr uint32_t maxProbes = 16u;
+
+        //! minimum number of macro electrons of a group to merge it, must be >= 3
+        static constexpr uint32_t minGroupSize = 3u;
+
+        /** deposit the current of the charge rearrangement into FieldJ
+         *
+         * OFF by default because measurement says the cure is worse than the disease. Merging moves every member's
+         *  charge to the group centroid, and a bilinear or higher shape does not preserve deposition under a
+         *  weighted-mean position, so the rearrangement does perturb eps0*div(E) - rho. Measured at 20 ppc over
+         *  300 steps, that perturbation is +13% on the residual a no-merging run already carries, while switching
+         *  this on raises it 5x.
+         *
+         * The reason is cancellation. Sum_i q w_i [S(x - xbar) - S(x - x_i)] is a small quantity assembled from N
+         *  large per-member deposits that must cancel, and they are accumulated in a float_X FieldJ, in global
+         *  memory, thousands of times per superCell per step. The residual was measured to scale with the number
+         *  of deposits, not to sit at a fixed multiple, which is what per-deposit rounding predicts and what a
+         *  sign error would not.
+         *
+         * Keep it off unless a case appears where the rearrangement itself matters. If one does, the fix is not to
+         *  turn this on: accumulate the correction per cell in float_64 shared memory and deposit once, rather
+         *  than once per member into float_X global memory.
+         */
+        static constexpr bool depositTransferCurrent = false;
+    };
+} // namespace picongpu::atomicPhysics::merging
