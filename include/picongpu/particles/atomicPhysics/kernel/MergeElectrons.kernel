@@ -1,0 +1,446 @@
+/* Copyright 2026 Prashant Sharma
+ *
+ * This file is part of PIConGPU.
+ *
+ * PIConGPU is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * PIConGPU is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with PIConGPU.
+ * If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/** @file merge the macro electrons of a superCell N->2 within groups of equal
+ *   (cell, electron histogram energy bin, momentum direction sextant)
+ */
+
+#pragma once
+
+#include "picongpu/defines.hpp"
+#include "picongpu/particles/atomicPhysics/GetPhysicalEnergy.hpp"
+#include "picongpu/particles/atomicPhysics/correctiveCurrent/TransferCurrent.hpp"
+#include "picongpu/particles/atomicPhysics/param.hpp"
+#include "picongpu/traits/attribute/GetCharge.hpp"
+#include "picongpu/traits/attribute/GetMass.hpp"
+
+#include <pmacc/lockstep/lockstep.hpp>
+#include <pmacc/memory/shared/Allocate.hpp>
+#include <pmacc/particles/algorithm/ForEach.hpp>
+#include <pmacc/static_assert.hpp>
+
+#include <cstdint>
+#include <limits>
+
+namespace picongpu::particles::atomicPhysics::kernel
+{
+    //! one open merge group of a superCell, sums over the macro electrons of the group
+    struct MergeGroup
+    {
+        static constexpr uint32_t emptyKey = 0xFFFFFFFFu;
+
+        uint32_t key;
+        //! macro electrons accumulated into the sums
+        uint32_t count;
+        //! members resolved so far, the first two become the survivors
+        uint32_t written;
+        //! sum w, unitless
+        float_64 weight;
+        //! sum w * u, u = p / (m c) per physical electron, unitless
+        float_64 momentum[3];
+        //! sum w * (gamma - 1), unitless
+        float_64 energy;
+        /** sum w * position in cell, unitless
+         *
+         * float_X unlike the other accumulators: the centroid is stored back into a float_X position attribute
+         *  and positions are bounded in [0,1), so its rounding is ~1e-5 of a cell and reaches nothing but the
+         *  transfer current's end point. Conservation of weight, momentum and energy must not round, those stay
+         *  float_64. Halves the table's shared memory footprint.
+         */
+        float_X position[simDim];
+    };
+
+    /** merge kernel
+     *
+     * Called once per PIC step for every superCell with more macro electrons than the trigger. A group is the set of
+     *  macro electrons of one cell that share an electron histogram energy bin and a momentum direction sextant.
+     *  Every group with at least minGroupSize members is replaced by two macro electrons of half the group weight
+     *  each, positioned at the weight centroid of the group and with momenta pbar +- q * n, n perpendicular to the
+     *  mean momentum pbar and q fixed by conservation of the group's kinetic energy. The survivors' energy is the
+     *  weighted mean energy of the group and therefore lies in the group's energy bin, so the next electron
+     *  histogram, and every rate derived from it, is unchanged to rounding.
+     *
+     * Moving charge to the centroid changes what the group deposits on the grid, so every member's charge is
+     *  transported to the centroid by an exact transfer current into FieldJ, see TransferCurrent.hpp. FieldJ has
+     *  been reset before this stage and is consumed by the field solver after the following particle push, exactly
+     *  as the field ionization current is.
+     *
+     * Groups live in a shared memory hash table of tableSize entries. Since the number of distinct groups of a
+     *  superCell exceeds that, cells take turns: on a given step only cells with (cell + step) % rotation == 0
+     *  are eligible, rotation being chosen so the eligible cells' groups fit the table. Every cell is thereby
+     *  merged once every `rotation` steps.
+     *
+     * @attention this sweep period, not the merge itself, sets the count a loaded superCell settles at. A cell
+     *  holds at most estimatedGroupsPerCell groups, so a full cell is merged alone and a heavily loaded superCell
+     *  needs numberCells steps per sweep, over which the cycling regrows it. Raising tableSize shortens the sweep
+     *  but costs shared memory; coarsening the key, several energy bins per group, shortens it far more but gives
+     *  up within-bin f(E).
+     *
+     * Two passes over the superCell's macro electrons: the first accumulates the group sums, the second resolves
+     *  every member of a merge-eligible group, the first two to arrive becoming the survivors and the rest being
+     *  deleted. No particle handles are stored.
+     *
+     * @tparam T_Histogram electron histogram type, used only for its energy binning
+     * @tparam T_Shape particle shape of the electron species, the transfer current must deposit with the shape that
+     *  deposits the species' charge density
+     */
+    template<typename T_Histogram, typename T_Shape>
+    struct MergeElectronsKernel
+    {
+        using Param = picongpu::atomicPhysics::merging::MergeElectronsParam;
+
+        static constexpr uint32_t numberCells = pmacc::math::CT::volume<picongpu::SuperCellSize>::type::value;
+        static constexpr uint32_t numberSectors = 6u;
+        static constexpr uint32_t tableMask = Param::tableSize - 1u;
+        static constexpr uint32_t invalidSlot = 0xFFFFFFFFu;
+
+        PMACC_CASSERT_MSG(merge_table_size_must_be_a_power_of_two, (Param::tableSize & tableMask) == 0u);
+        PMACC_CASSERT_MSG(merge_table_size_must_be_at_least_2, Param::tableSize >= 2u);
+        PMACC_CASSERT_MSG(merge_min_group_size_must_be_at_least_3, Param::minGroupSize >= 3u);
+
+        struct Table
+        {
+            MergeGroup entries[Param::tableSize];
+        };
+
+        HDINLINE static constexpr uint32_t tableBits()
+        {
+            uint32_t bits = 0u;
+            for(uint32_t size = Param::tableSize; size > 1u; size >>= 1u)
+                ++bits;
+            return bits;
+        }
+
+        //! multiplicative hash, high bits are the well mixed ones
+        HDINLINE static uint32_t hash(uint32_t const key)
+        {
+            return (key * 2654435761u) >> (32u - tableBits());
+        }
+
+        HDINLINE static bool isEligible(uint32_t const cell, uint32_t const rotation, uint32_t const step)
+        {
+            return ((cell + step) % rotation) == 0u;
+        }
+
+        /** group key of a macro electron
+         *
+         * @return false if the electron's energy lies outside the histogram range, such electrons are never merged
+         */
+        template<typename T_Particle>
+        HDINLINE static bool computeKey(T_Histogram const& histogram, T_Particle const& electron, uint32_t& key)
+        {
+            // eV
+            float_X const energy = GetPhysicalEnergy::KineticEnergy(electron);
+            if(!histogram.inRange(energy))
+                return false;
+            uint32_t const bin = histogram.getBinIndex(energy);
+
+            float3_X const p = electron[momentum_];
+            uint32_t axis = 0u;
+            float_X largest = math::abs(p.x());
+            if(math::abs(p.y()) > largest)
+            {
+                axis = 1u;
+                largest = math::abs(p.y());
+            }
+            if(math::abs(p.z()) > largest)
+                axis = 2u;
+            uint32_t const sector = 2u * axis + ((p[axis] < 0._X) ? 1u : 0u);
+
+            uint32_t const cell = static_cast<uint32_t>(electron[localCellIdx_]);
+            key = (cell * T_Histogram::numberBins + bin) * numberSectors + sector;
+            return true;
+        }
+
+        template<typename T_Worker>
+        HDINLINE static uint32_t findOrInsert(T_Worker const& worker, Table& table, uint32_t const key)
+        {
+            // local copy, nvcc rejects an ODR-use of a constexpr static member in device code
+            uint32_t const empty = MergeGroup::emptyKey;
+            uint32_t slot = hash(key);
+            for(uint32_t probe = 0u; probe < Param::maxProbes; ++probe)
+            {
+                uint32_t const previous = alpaka::atomicCas(
+                    worker.getAcc(),
+                    &table.entries[slot].key,
+                    empty,
+                    key,
+                    ::alpaka::hierarchy::Threads{});
+                if(previous == empty || previous == key)
+                    return slot;
+                slot = (slot + 1u) & tableMask;
+            }
+            return invalidSlot;
+        }
+
+        //! lookup in the finished table, same probe sequence as findOrInsert
+        HDINLINE static uint32_t find(Table const& table, uint32_t const key)
+        {
+            uint32_t slot = hash(key);
+            for(uint32_t probe = 0u; probe < Param::maxProbes; ++probe)
+            {
+                uint32_t const present = table.entries[slot].key;
+                if(present == key)
+                    return slot;
+                if(present == MergeGroup::emptyKey)
+                    return invalidSlot;
+                slot = (slot + 1u) & tableMask;
+            }
+            return invalidSlot;
+        }
+
+        //! cell origin of a macro electron in superCell-local cell units
+        template<typename T_Particle>
+        HDINLINE static pmacc::math::Vector<float_X, simDim> cellOrigin(T_Particle const& electron)
+        {
+            auto const cell
+                = pmacc::math::mapToND(picongpu::SuperCellSize::toRT(), static_cast<int>(electron[localCellIdx_]));
+            pmacc::math::Vector<float_X, simDim> origin;
+            for(uint32_t d = 0u; d < simDim; ++d)
+                origin[d] = static_cast<float_X>(cell[d]);
+            return origin;
+        }
+
+        /** call operator
+         *
+         * @param worker object containing the device and block information, passed by PMACC_KERNEL call
+         * @param areaMapping mapping of blockIndex to block superCell index
+         * @param electronBox deviceDataBox giving access to the electron species particle frames of all local
+         *  superCells
+         * @param histogramBox deviceDataBox giving access to the local electron histograms of all local superCells
+         * @param jBox deviceDataBox of FieldJ, guard included
+         * @param currentStep current PIC step, rotates the merge eligible cells
+         */
+        template<
+            typename T_Worker,
+            typename T_AreaMapping,
+            typename T_ElectronBox,
+            typename T_HistogramBox,
+            typename T_JBox>
+        HDINLINE void operator()(
+            T_Worker const& worker,
+            T_AreaMapping const areaMapping,
+            T_ElectronBox electronBox,
+            T_HistogramBox const histogramBox,
+            T_JBox jBox,
+            uint32_t const currentStep) const
+        {
+            pmacc::DataSpace<simDim> const superCellIdx = areaMapping.getSuperCellIndex(worker.blockDomIdxND());
+            // atomicPhysics superCellFields have no guard, but areMapping includes a guard
+            pmacc::DataSpace<simDim> const superCellFieldIdx = superCellIdx - areaMapping.getGuardingSuperCells();
+
+            uint32_t const numParticles = electronBox.getSuperCell(superCellIdx).getNumParticles();
+            if(numParticles <= Param::triggerMacroParticlesPerCell * numberCells)
+                return;
+
+            T_Histogram const& histogram = histogramBox(superCellFieldIdx);
+            auto forEachElectron = pmacc::particles::algorithm::acc::makeForEach(worker, electronBox, superCellIdx);
+            // same convention as the field ionization current, ADK_Impl.hpp
+            auto jBoxSuperCell = jBox.shift(superCellIdx * picongpu::SuperCellSize::toRT());
+
+            PMACC_SMEM(worker, table, Table);
+
+            auto forEachEntry = pmacc::lockstep::makeForEach<Param::tableSize, T_Worker>(worker);
+            forEachEntry(
+                [&table](uint32_t const idx)
+                {
+                    MergeGroup& group = table.entries[idx];
+                    group.key = MergeGroup::emptyKey;
+                    group.count = 0u;
+                    group.written = 0u;
+                    group.weight = 0.0;
+                    group.energy = 0.0;
+                    for(uint32_t d = 0u; d < 3u; ++d)
+                        group.momentum[d] = 0.0;
+                    for(uint32_t d = 0u; d < simDim; ++d)
+                        group.position[d] = 0._X;
+                });
+            worker.sync();
+
+            /* How many cells may be merge eligible at once is set by the GROUPS they hold, not by the particle
+             *  count: a cell holds at most one group per (energy bin, sextant) however many macro electrons sit
+             *  in it. A sparsely filled cell cannot hold more groups than it has particles, so the estimate is
+             *  capped from below by that too, which lets lightly loaded superCells sweep all their cells in a
+             *  few steps instead of numberCells steps. */
+            uint32_t const cellsPerSuperCell = numberCells;
+            uint32_t const particlesPerCell = (numParticles + cellsPerSuperCell - 1u) / cellsPerSuperCell;
+            // local copy, nvcc rejects an ODR-use of a constexpr static member in device code
+            uint32_t const estimatedGroups = Param::estimatedGroupsPerCell;
+            uint32_t const groupsPerCell = pmacc::math::max(pmacc::math::min(particlesPerCell, estimatedGroups), 1u);
+            uint32_t const cellsPerPass = pmacc::math::max(Param::tableSize / groupsPerCell, 1u);
+            uint32_t const rotation = pmacc::math::max(
+                (cellsPerSuperCell + cellsPerPass - 1u) / cellsPerPass,
+                1u);
+
+            using FrameType = typename T_ElectronBox::FrameType;
+            float_64 const mass = static_cast<float_64>(picongpu::traits::frame::getMass<FrameType>());
+            constexpr float_64 c_internal
+                = picongpu::sim.si.getSpeedOfLight() * sim.unit.time() / sim.unit.length();
+            // momentum_ is weight scaled: u = momentum_ / (w m c)
+            float_64 const momentumToU = 1.0 / (mass * c_internal);
+
+
+            // accumulate the group sums
+            forEachElectron(
+                [&](T_Worker const&, auto& electron)
+                {
+                    /* the preceding spawn stages compact only in debug builds and rely on never leaving
+                     *  holes, a deleted particle keyed here would be resurrected as a survivor */
+                    if(electron[multiMask_] == 0)
+                        return;
+                    uint32_t const cell = static_cast<uint32_t>(electron[localCellIdx_]);
+                    if(!isEligible(cell, rotation, currentStep))
+                        return;
+                    uint32_t key;
+                    if(!computeKey(histogram, electron, key))
+                        return;
+
+                    uint32_t const slot = findOrInsert(worker, table, key);
+                    if(slot == invalidSlot)
+                        return;
+                    MergeGroup& group = table.entries[slot];
+                    alpaka::atomicAdd(worker.getAcc(), &group.count, 1u, ::alpaka::hierarchy::Threads{});
+
+                    float_64 const w = static_cast<float_64>(electron[weighting_]);
+                    // w * u
+                    float3_64 const wu = static_cast<float3_64>(electron[momentum_]) * momentumToU;
+                    float_64 const uSquared = pmacc::math::l2norm2(wu) / (w * w);
+                    // numerically stable gamma - 1
+                    float_64 const gammaMinusOne = uSquared / (math::sqrt(1.0 + uSquared) + 1.0);
+                    floatD_X const position = electron[position_];
+
+                    alpaka::atomicAdd(worker.getAcc(), &group.weight, w, ::alpaka::hierarchy::Threads{});
+                    alpaka::atomicAdd(
+                        worker.getAcc(),
+                        &group.energy,
+                        w * gammaMinusOne,
+                        ::alpaka::hierarchy::Threads{});
+                    for(uint32_t d = 0u; d < 3u; ++d)
+                        alpaka::atomicAdd(
+                            worker.getAcc(),
+                            &group.momentum[d],
+                            wu[d],
+                            ::alpaka::hierarchy::Threads{});
+                    for(uint32_t d = 0u; d < simDim; ++d)
+                        alpaka::atomicAdd(
+                            worker.getAcc(),
+                            &group.position[d],
+                            electron[weighting_] * position[d],
+                            ::alpaka::hierarchy::Threads{});
+                });
+            worker.sync();
+
+            /* resolve every member of a merge eligible group: transport its charge to the centroid, then make it a
+             *  survivor if it is among the first two to arrive, otherwise delete it */
+            forEachElectron(
+                [&](T_Worker const&, auto& electron)
+                {
+                    /* the preceding spawn stages compact only in debug builds and rely on never leaving
+                     *  holes, a deleted particle keyed here would be resurrected as a survivor */
+                    if(electron[multiMask_] == 0)
+                        return;
+                    uint32_t const cell = static_cast<uint32_t>(electron[localCellIdx_]);
+                    if(!isEligible(cell, rotation, currentStep))
+                        return;
+                    uint32_t key;
+                    if(!computeKey(histogram, electron, key))
+                        return;
+                    uint32_t const slot = find(table, key);
+                    if(slot == invalidSlot)
+                        return;
+                    MergeGroup& group = table.entries[slot];
+                    if(group.count < Param::minGroupSize)
+                        return;
+
+                    float_64 const W = group.weight;
+                    floatD_X centroid;
+                    // a float_X position sum can round up to W exactly, positions must stay below 1
+                    constexpr float_X belowOne = 1._X - std::numeric_limits<float_X>::epsilon() * 0.5_X;
+                    for(uint32_t d = 0u; d < simDim; ++d)
+                        centroid[d] = pmacc::math::min(
+                            static_cast<float_X>(static_cast<float_64>(group.position[d]) / W),
+                            belowOne);
+
+                    if constexpr(Param::depositTransferCurrent)
+                    {
+                        auto const origin = cellOrigin(electron);
+                        floatD_X const inCell = electron[position_];
+                        /* Grids, not the primitive's default: this writes into the shared FieldJ and
+                         *  the shape reaches into cells neighbouring superCells also write. */
+                        correctiveCurrent::depositTransferCurrent<
+                            T_Shape,
+                            T_Worker,
+                            decltype(jBoxSuperCell),
+                            ::alpaka::hierarchy::Grids>(
+                            worker,
+                            jBoxSuperCell,
+                            origin + inCell,
+                            origin + centroid,
+                            picongpu::traits::attribute::getCharge(electron[weighting_], electron),
+                            picongpu::sim.pic.getDt(),
+                            picongpu::sim.pic.getCellSize(),
+                            correctiveCurrent::AxisOrder::Forward);
+                    }
+
+                    uint32_t const member
+                        = alpaka::atomicAdd(worker.getAcc(), &group.written, 1u, ::alpaka::hierarchy::Threads{});
+                    if(member >= 2u)
+                    {
+                        // host side stage must call fillAllGaps() afterwards
+                        electron[multiMask_] = 0;
+                        return;
+                    }
+
+                    float3_64 const uBar
+                        = float3_64(group.momentum[0], group.momentum[1], group.momentum[2]) / W;
+                    // gammaBar - 1, gammaBar^2 - 1 = eps * (2 + eps): forming 1 + eps would erase cold groups' energy
+                    float_64 const eps = group.energy / W;
+                    // convexity of gamma(u) gives qSquared >= 0 in exact arithmetic, clamp rounding
+                    float_64 const qSquared = eps * (2.0 + eps) - pmacc::math::l2norm2(uBar);
+                    float_64 const q = math::sqrt(pmacc::math::max(qSquared, 0.0));
+
+                    /* n perpendicular to uBar, with an azimuth around uBar that varies by group and step so the
+                     *  survivor pairs of a cell do not all open in the same plane */
+                    float_64 const uBarNorm = pmacc::math::l2norm(uBar);
+                    float3_64 const e = (uBarNorm > 0.0) ? uBar / uBarNorm : float3_64(1.0, 0.0, 0.0);
+                    float3_64 a = float3_64(1.0, 0.0, 0.0);
+                    if(math::abs(e.y()) < math::abs(e.x()) && math::abs(e.y()) <= math::abs(e.z()))
+                        a = float3_64(0.0, 1.0, 0.0);
+                    else if(math::abs(e.z()) < math::abs(e.x()))
+                        a = float3_64(0.0, 0.0, 1.0);
+                    float3_64 n1 = pmacc::math::cross(e, a);
+                    n1 = n1 / pmacc::math::l2norm(n1);
+                    float3_64 const n2 = pmacc::math::cross(e, n1);
+                    uint32_t h = (key ^ (currentStep * 2654435761u)) * 2246822519u;
+                    h ^= h >> 15u;
+                    float_64 const phi = 2.0 * pmacc::math::Pi<float_64>::value
+                        * static_cast<float_64>(h & 0xFFFFFFu) / 16777216.0;
+                    float3_64 const n = n1 * math::cos(phi) + n2 * math::sin(phi);
+
+                    float_64 const sign = (member == 0u) ? 1.0 : -1.0;
+                    float3_64 const u = uBar + n * (sign * q);
+                    float_64 const halfWeight = 0.5 * W;
+
+                    electron[weighting_] = static_cast<float_X>(halfWeight);
+                    electron[momentum_] = static_cast<float3_X>(u * (halfWeight * mass * c_internal));
+                    electron[position_] = centroid;
+                });
+        }
+    };
+} // namespace picongpu::particles::atomicPhysics::kernel
