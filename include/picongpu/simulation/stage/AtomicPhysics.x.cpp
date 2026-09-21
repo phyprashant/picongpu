@@ -44,6 +44,7 @@
 #include "picongpu/particles/atomicPhysics/stage/FillRateCache.hpp"
 #include "picongpu/particles/atomicPhysics/stage/FixAtomicState.hpp"
 #include "picongpu/particles/atomicPhysics/stage/LoadAtomicInputData.hpp"
+#include "picongpu/particles/atomicPhysics/stage/MergeElectrons.hpp"
 #include "picongpu/particles/atomicPhysics/stage/RecordChanges.hpp"
 #include "picongpu/particles/atomicPhysics/stage/RecordSuggestedChanges.hpp"
 #include "picongpu/particles/atomicPhysics/stage/RecordSuggestedFieldEnergyUse.hpp"
@@ -597,6 +598,18 @@ namespace picongpu::simulation::stage
                 spawnIonizationElectrons</*checkForAccepted*/ std::false_type>(mappingDesc, currentStep);
             }
 
+            /** merge macro electrons of superCells above the merge trigger, see particleMerging.param
+             *
+             * @attention must run after the last spawning of the step, the sub-stepping loop and the post-loop IPD
+             *  ionization, since only then the count it bounds is final
+             */
+            HINLINE static void mergeElectrons(picongpu::MappingDesc const& mappingDesc, uint32_t const currentStep)
+            {
+                using ForEachElectronSpeciesMergeElectrons = pmacc::meta::
+                    ForEach<AtomicPhysicsElectronSpecies, particles::atomicPhysics::stage::MergeElectrons<boost::mpl::_1>>;
+                ForEachElectronSpeciesMergeElectrons{}(mappingDesc, currentStep);
+            }
+
             HINLINE static void updateElectricField(picongpu::MappingDesc const& mappingDesc)
             {
                 picongpu::particles::atomicPhysics::stage::UpdateElectricField<T_numberAtomicPhysicsIonSpecies>()(
@@ -843,6 +856,9 @@ namespace picongpu::simulation::stage
                     mappingDesc,
                     currentStep,
                     deviceLocalReduce);
+
+                if constexpr(picongpu::atomicPhysics::merging::MergeElectronsParam::enabled)
+                    mergeElectrons(mappingDesc, currentStep);
 
                 // temporary instrumentation output, one line per PIC step
                 std::cout << "[atomicPhysics instrumentation] step " << currentStep << ": subSteps=" << numSubSteps
