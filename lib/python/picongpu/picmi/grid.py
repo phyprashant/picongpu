@@ -219,6 +219,53 @@ class Cartesian3DGrid(picmistandard.PICMI_Cartesian3DGrid):
     def check(self):
         _check_cartesian_grid(self, ["x", "y", "z"])
 
+    def to_2d(self) -> "Cartesian2DGrid":
+        """Reduce this 3D grid to a 2D (2D3V) grid, dropping the z (third) component.
+
+        Every vector field is mapped from a 3-tuple to a 2-tuple by keeping the
+        (x, y) components. The z cell length is preserved as the 2D slab
+        thickness via ``picongpu_cell_depth_si``. If the 3D super cell is the
+        default ``(8, 8, 4)`` it maps to the 2D default ``(16, 16)``; an
+        explicitly-set 3D super cell keeps its (x, y) components (detected via
+        ``model_fields_set``, not by value, so an explicit ``(8, 8, 4)`` is
+        preserved as ``(8, 8)``). A fresh ``Cartesian2DGrid`` is returned and the
+        source grid is not modified; the result is then validated with the 2D
+        ``check()`` so a 3D grid whose reduction does not satisfy the 2D
+        constraints raises at the call site rather than returning an invalid grid.
+        """
+        number_of_cells = self.number_of_cells[:2]
+        lower_bound = self.lower_bound[:2]
+        upper_bound = self.upper_bound[:2]
+        lower_boundary_conditions = self.lower_boundary_conditions[:2]
+        upper_boundary_conditions = self.upper_boundary_conditions[:2]
+
+        # The 3D default super cell maps to the 2D default; an explicitly-set
+        # super cell (including a deliberate ``(8, 8, 4)``) keeps its (x, y).
+        # ``model_fields_set`` tells explicit from default; the value cannot.
+        if "picongpu_super_cell_size" in self.model_fields_set:
+            super_cell_size = self.picongpu_super_cell_size[:2]
+        else:
+            super_cell_size = (16, 16)
+
+        kwargs = dict(
+            number_of_cells=number_of_cells,
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+            lower_boundary_conditions=lower_boundary_conditions,
+            upper_boundary_conditions=upper_boundary_conditions,
+            picongpu_super_cell_size=super_cell_size,
+            picongpu_cell_depth_si=self.picongpu_cell_size[2],
+        )
+        if self.guard_cells is not None:
+            kwargs["guard_cells"] = self.guard_cells[:2]
+        if self.picongpu_n_gpus != (1, 1, 1):
+            kwargs["picongpu_n_gpus"] = self.picongpu_n_gpus[:2]
+        if self.picongpu_grid_dist is not None:
+            kwargs["picongpu_grid_dist"] = self.picongpu_grid_dist[:2]
+        grid_2d = Cartesian2DGrid(**kwargs)
+        grid_2d.check()
+        return grid_2d
+
 
 @converts_to(
     grid.Grid2D,
@@ -229,8 +276,13 @@ class Cartesian3DGrid(picmistandard.PICMI_Cartesian3DGrid):
         ),
         "cell_cnt": "number_of_cells",
         # In 2D3V the Z cell length (CELL_DEPTH_SI) is still used to normalize
-        # densities; we take the x cell size as the default wire-particle length.
-        "cell_depth_si": lambda self: (self.upper_bound[0] - self.lower_bound[0]) / self.number_of_cells[0],
+        # densities; we take the x cell size as the default wire-particle length
+        # unless the user explicitly overrides it via picongpu_cell_depth_si.
+        "cell_depth_si": lambda self: (
+            self.picongpu_cell_depth_si
+            if self.picongpu_cell_depth_si is not None
+            else (self.upper_bound[0] - self.lower_bound[0]) / self.number_of_cells[0]
+        ),
         "guard_size": lambda self: (
             None
             if self.guard_cells is None
@@ -251,6 +303,15 @@ class Cartesian2DGrid(picmistandard.PICMI_Cartesian2DGrid):
     picongpu_grid_dist: None | list[list[int]] = Field(default=None)
     # PIConGPU's 2D setups (e.g. the FoilLCT example) use a <16, 16> super cell.
     picongpu_super_cell_size: tuple[int, int] = Field(default=(16, 16))
+    # In 2D3V the Z cell length (CELL_DEPTH_SI) is the wire-particle integration
+    # length used to normalize densities. When left as None, the conversion falls
+    # back to the x cell size (dx); set it to override the slab thickness.
+    picongpu_cell_depth_si: Annotated[
+        float | None,
+        AfterValidator(
+            lambda x: x if x is None or x > 0 else (_ for _ in ()).throw(ValueError("cell depth must be > 0"))
+        ),
+    ] = Field(default=None)
 
     @computed_field
     def picongpu_cell_size(self) -> tuple[int, int]:
