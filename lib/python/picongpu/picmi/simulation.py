@@ -38,6 +38,8 @@ from picongpu.picmi.species_requirements import (
     resolving_add,
     run_construction,
 )
+from picongpu.picmi.memory_config import MemoryConfig
+from picongpu.picmi.precision_config import PrecisionConfig
 from picongpu.pypicongpu.output.openpmd_plugin import FieldDump as PyPIConGPUFieldDump
 from picongpu.pypicongpu.output.openpmd_plugin import OpenPMDPlugin
 from picongpu.pypicongpu.runner import Runner
@@ -179,7 +181,8 @@ class Simulation(picmistandard.PICMI_Simulation):
 
     used for normalization of code units
 
-    optional, if set to None, will be set to median ppc of all species ppcs
+    optional, if set to None, will be set to the integer midpoint between the
+    smallest and largest per-layout ppc of the initialized species
     """
 
     picongpu_template_dir: Annotated[tuple[Path, ...], BeforeValidator(_normalise_template_dir)] = Field(default=())
@@ -208,6 +211,20 @@ class Simulation(picmistandard.PICMI_Simulation):
 
     32 (single precision, default) or 64 (double precision). Controls the
     ``precisionPIConGPU`` namespace in the generated ``precision.param``.
+    """
+
+    picongpu_precision_config: PrecisionConfig = Field(default_factory=PrecisionConfig)
+    """
+    per-namespace precision overrides (sqrt/exp/trig) rendered into ``precision.param``
+    (see ``PrecisionConfig``).
+
+    ``"core"`` (default) aliases the core ``precisionPIConGPU`` precision; ``32``/``64``
+    force ``precision32Bit``/``precision64Bit`` respectively.
+    """
+
+    picongpu_memory_config: MemoryConfig = Field(default_factory=MemoryConfig)
+    """
+    memory / exchange-buffer knobs rendered into ``memory.param`` (see ``MemoryConfig``).
     """
 
     picongpu_walltime: datetime.timedelta | None = Field(default=None)
@@ -417,6 +434,23 @@ class Simulation(picmistandard.PICMI_Simulation):
                             f"You gave a density formula depending on 'z' for species {species.name!r} on a 2D grid."
                         )
 
+    def _check_huygens_surface_positions(self):
+        # Every laser renders into the single incidentField, so all lasers must
+        # share one Huygens surface. Enforce strict list-equality of the three
+        # [neg, pos] pairs, using the first laser as the reference
+        # (https://github.com/chillenzer-agents/picongpu/issues/115).
+        if len(self.lasers) <= 1:
+            return
+        reference = self.lasers[0].picongpu_huygens_surface_positions
+        for laser in self.lasers[1:]:
+            if laser.picongpu_huygens_surface_positions != reference:
+                raise ValueError(
+                    f"Inconsistent Huygens surface positions across lasers: {type(laser).__name__} has "
+                    f"picongpu_huygens_surface_positions={laser.picongpu_huygens_surface_positions} but "
+                    f"{type(self.lasers[0]).__name__} (the first laser) uses {reference}. "
+                    "set every laser's `picongpu_huygens_surface_positions` to the same value."
+                )
+
     def _collect_particle_filters(self):
         # This does not necessarily work on Binning plugin
         # because that might have a list of species.
@@ -437,6 +471,7 @@ class Simulation(picmistandard.PICMI_Simulation):
     def get_as_pypicongpu(self) -> pypicongpu.simulation.Simulation:
         """translate to PyPIConGPU object"""
         self._check_compatibility()
+        self._check_huygens_surface_positions()
 
         init_operations = organise_init_operations(
             chain(*(s.get_operation_requirements() for s in sorted(self.species)))
@@ -494,6 +529,8 @@ class Simulation(picmistandard.PICMI_Simulation):
             synchrotron_params=synchrotron_params[0],
             collisional_physics=collisions[0].get_as_pypicongpu(),
             precision=self.picongpu_precision,
+            precision_overrides=self.picongpu_precision_config.get_as_pypicongpu(),
+            memory_config=self.picongpu_memory_config.get_as_pypicongpu(),
         )
 
     def _get_base_density(self) -> float:
